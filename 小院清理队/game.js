@@ -11,6 +11,9 @@ const bossSprite = wx.createImage();
 const rabbitSprite = wx.createImage();
 const apeSprite = wx.createImage();
 const stalkerSprite = wx.createImage();
+const bruteSprite = wx.createImage();
+const runnerSprite = wx.createImage();
+const eliteSprite = wx.createImage();
 
 let screen = 'menu';
 let width = system.screenWidth;
@@ -26,6 +29,9 @@ let bossReady = false;
 let rabbitReady = false;
 let apeReady = false;
 let stalkerReady = false;
+let bruteReady = false;
+let runnerReady = false;
+let eliteReady = false;
 let menuButton = null;
 let wardrobeButton = null;
 let gardenButton = null;
@@ -94,30 +100,41 @@ const soundLastPlayed = {};
 const stickWidth = 76;
 const stickHeight = 10;
 const bossSpawnTime = 150;
+const skillRarity = {
+  white: { label: '白色', color: '#8a8d7b', weight: 35, points: 1 },
+  blue: { label: '蓝色', color: '#3498d5', weight: 25, points: 2 },
+  purple: { label: '紫色', color: '#9760c8', weight: 20, points: 3 },
+  gold: { label: '金色', color: '#c58a13', weight: 15, points: 5 },
+  red: { label: '红色', color: '#d84b52', weight: 5, points: 8 },
+};
 
 const upgrades = [
-  { title: '棍子数量 +1', description: '多一根棍子环绕攻击', apply: () => { game.orbitStickCount += 1; } },
-  { title: '强力棍子', description: '基础攻击之外额外 +1', apply: () => { game.bonusAttack += 1; } },
-  { title: '快速旋转', description: '环绕旋转速度提高', apply: () => { game.orbitSpeed += 0.45; } },
-  { title: '扩大轨道', description: '棍子环绕范围扩大', apply: () => { game.orbitRadius += 12; } },
-  { title: '轻便鞋子', description: '移动速度提高', apply: () => { game.moveSpeed += 24; } },
-  { title: '收集袋', description: '经验吸取范围扩大', apply: () => { game.pickupRange += 24; } },
-  { title: '急救包', description: '恢复生命并增加上限', apply: () => { game.maxHealth += 20; game.health = Math.min(game.maxHealth, game.health + 35); } },
-  { title: '坚韧外衣', description: '每次碰撞少受 2 点伤害', apply: () => { game.damageReduction += 2; } },
-  { title: '长棍术', description: '环绕棍子的攻击距离增加', apply: () => { game.stickHitHalfLength += 10; } },
-  { title: '疾风步', description: '冲刺冷却缩短 0.8 秒', apply: () => { game.dashCooldownMax = Math.max(1.6, game.dashCooldownMax - 0.8); } },
-  { title: '棍云冲撞', description: '冲刺伤害提高，棍子越多伤害越高', apply: () => { game.dashBonusDamage += 3; } },
+  { title: '棍子数量 +1', description: '多一根棍子环绕攻击', rarity: 'purple', apply: () => { game.orbitStickCount += 1; } },
+  { title: '强力棍子', description: '基础攻击之外额外 +1', rarity: 'blue', apply: () => { game.bonusAttack += 1; } },
+  { title: '快速旋转', description: '环绕旋转速度提高', rarity: 'blue', apply: () => { game.orbitSpeed += 0.45; } },
+  { title: '扩大轨道', description: '棍子环绕范围扩大', rarity: 'blue', apply: () => { game.orbitRadius += 12; } },
+  { title: '轻便鞋子', description: '移动速度提高', rarity: 'white', apply: () => { game.moveSpeed += 24; } },
+  { title: '收集袋', description: '经验吸取范围扩大', rarity: 'white', apply: () => { game.pickupRange += 24; } },
+  { title: '急救包', description: '恢复生命并增加上限', rarity: 'white', apply: () => { game.maxHealth += 20; game.health = Math.min(game.maxHealth, game.health + 35); } },
+  { title: '坚韧外衣', description: '每次碰撞少受 2 点伤害', rarity: 'white', apply: () => { game.damageReduction += 2; } },
+  { title: '长棍术', description: '环绕棍子的攻击距离增加', rarity: 'blue', apply: () => { game.stickHitHalfLength += 10; } },
+  { title: '疾风步', description: '冲刺冷却缩短 0.8 秒', rarity: 'white', apply: () => { game.dashCooldownMax = Math.max(1.6, game.dashCooldownMax - 0.8); } },
+  { title: '棍云冲撞', description: '冲刺伤害提高，棍子越多伤害越高', rarity: 'purple', apply: () => { game.dashBonusDamage += 3; } },
+  { title: '金刚护体', description: '生命上限 +80，碰撞减伤 +6', rarity: 'gold', apply: () => { game.maxHealth += 80; game.health = Math.min(game.maxHealth, game.health + 80); game.damageReduction += 6; } },
+  { title: '赤霄雷暴棍', description: '雷电棍进化，棍子 +2，旋转速度 +35%', rarity: 'red', apply: () => { game.weaponEvolution = 'lightning'; game.orbitStickCount += 2; game.orbitSpeed *= 1.35; } },
 ];
 const rabbitUpgrades = [
-  { title: '高压弹头', description: '子弹伤害 +2', apply: () => { game.bulletDamage += 2; } },
-  { title: '快速装填', description: '射击间隔缩短 0.12 秒', apply: () => { game.fireInterval = Math.max(0.18, game.fireInterval - 0.12); } },
-  { title: '双发点射', description: '每轮额外发射 1 枚追踪子弹', apply: () => { game.projectileCount += 1; } },
-  { title: '穿透弹头', description: '每枚子弹可多命中 1 个敌人', apply: () => { game.projectilePierce += 1; } },
-  { title: '追踪芯片', description: '子弹飞行速度 +100', apply: () => { game.projectileSpeed += 100; } },
-  { title: '战术翻滚', description: '冲刺冷却缩短 0.8 秒', apply: () => { game.dashCooldownMax = Math.max(1.6, game.dashCooldownMax - 0.8); } },
-  { title: '急救补给', description: '恢复生命并增加上限', apply: () => { game.maxHealth += 20; game.health = Math.min(game.maxHealth, game.health + 35); } },
-  { title: '轻装行动', description: '移动速度提高', apply: () => { game.moveSpeed += 24; } },
-  { title: '加大弹匣', description: '子弹伤害 +1，射击间隔缩短 0.04 秒', apply: () => { game.bulletDamage += 1; game.fireInterval = Math.max(0.18, game.fireInterval - 0.04); } },
+  { title: '高压弹头', description: '子弹伤害 +2', rarity: 'blue', apply: () => { game.bulletDamage += 2; } },
+  { title: '快速装填', description: '射击间隔缩短 0.12 秒', rarity: 'purple', apply: () => { game.fireInterval = Math.max(0.18, game.fireInterval - 0.12); } },
+  { title: '双发点射', description: '每轮额外发射 1 枚追踪子弹', rarity: 'purple', apply: () => { game.projectileCount += 1; } },
+  { title: '穿透弹头', description: '每枚子弹可多命中 1 个敌人', rarity: 'purple', apply: () => { game.projectilePierce += 1; } },
+  { title: '追踪芯片', description: '子弹飞行速度 +100', rarity: 'blue', apply: () => { game.projectileSpeed += 100; } },
+  { title: '战术翻滚', description: '冲刺冷却缩短 0.8 秒', rarity: 'white', apply: () => { game.dashCooldownMax = Math.max(1.6, game.dashCooldownMax - 0.8); } },
+  { title: '急救补给', description: '恢复生命并增加上限', rarity: 'white', apply: () => { game.maxHealth += 20; game.health = Math.min(game.maxHealth, game.health + 35); } },
+  { title: '轻装行动', description: '移动速度提高', rarity: 'white', apply: () => { game.moveSpeed += 24; } },
+  { title: '加大弹匣', description: '子弹伤害 +1，射击间隔缩短 0.04 秒', rarity: 'blue', apply: () => { game.bulletDamage += 1; game.fireInterval = Math.max(0.18, game.fireInterval - 0.04); } },
+  { title: '精准连射', description: '子弹伤害 +5，弹数 +1，射速提升', rarity: 'gold', apply: () => { game.bulletDamage += 5; game.projectileCount += 1; game.fireInterval = Math.max(0.18, game.fireInterval - 0.12); } },
+  { title: '赤焰追踪弹', description: '爆裂进化，伤害 +8，弹数 +2', rarity: 'red', apply: () => { game.weaponEvolution = 'explosion'; game.bulletDamage += 8; game.projectileCount += 2; } },
 ];
 
 function loadProfile() {
@@ -241,6 +258,51 @@ function finishGame(won) {
   playSound(won ? 'levelup' : 'hurt', 500);
 }
 
+function isEnemyVisible(enemy) {
+  const radius = enemy.radius || 0;
+  return enemy.x + radius >= game.camera.x && enemy.x - radius <= game.camera.x + width
+    && enemy.y + radius >= game.camera.y && enemy.y - radius <= game.camera.y + height;
+}
+
+function getEnemyBuffMultipliers(points = game.enemyBuffPoints) {
+  return {
+    speed: 1 + points * 0.012,
+    damage: 1 + points * 0.016,
+    health: 1 + points * 0.024,
+  };
+}
+
+function enemyBuffDescription(rarity) {
+  const previous = getEnemyBuffMultipliers();
+  const next = getEnemyBuffMultipliers(game.enemyBuffPoints + skillRarity[rarity].points);
+  const percent = (key) => Math.round((next[key] / previous[key] - 1) * 100);
+  return `怪物强化：移速 +${percent('speed')}% · 伤害 +${percent('damage')}% · 生命 +${percent('health')}%`;
+}
+
+function applyEnemyBuff(rarity) {
+  const previous = getEnemyBuffMultipliers();
+  game.enemyBuffPoints += skillRarity[rarity].points;
+  const next = getEnemyBuffMultipliers();
+  const speedRatio = next.speed / previous.speed;
+  const damageRatio = next.damage / previous.damage;
+  const healthRatio = next.health / previous.health;
+  for (const enemy of game.enemies) {
+    enemy.speed *= speedRatio;
+    enemy.damage = Math.max(1, Math.round((enemy.damage || (enemy.boss ? 16 : 10)) * damageRatio));
+    enemy.maxHealth = Math.round(enemy.maxHealth * healthRatio);
+    enemy.health = Math.min(enemy.maxHealth, Math.round(enemy.health * healthRatio));
+  }
+}
+
+function applyCurrentEnemyBuff(enemy) {
+  const buff = getEnemyBuffMultipliers();
+  enemy.maxHealth = Math.round(enemy.maxHealth * buff.health);
+  enemy.health = enemy.maxHealth;
+  enemy.speed *= buff.speed;
+  enemy.damage = Math.max(1, Math.round((enemy.damage || (enemy.boss ? 16 : 10)) * buff.damage));
+  return enemy;
+}
+
 background.onload = () => {
   backgroundReady = true;
   draw();
@@ -281,10 +343,46 @@ rabbitSprite.onload = () => { rabbitReady = true; draw(); };
 rabbitSprite.src = 'assets/slim-dudu.png';
 
 apeSprite.onload = () => { apeReady = true; draw(); };
-apeSprite.src = 'assets/ape-enemy.jpg';
+apeSprite.src = 'assets/ape-enemy.png';
 
 stalkerSprite.onload = () => { stalkerReady = true; draw(); };
-stalkerSprite.src = 'assets/stalker-enemy.jpg';
+stalkerSprite.src = 'assets/stalker-enemy.png';
+
+bruteSprite.onload = () => { bruteReady = true; draw(); };
+bruteSprite.src = 'assets/brute-enemy.png';
+
+runnerSprite.onload = () => { runnerReady = true; draw(); };
+runnerSprite.src = 'assets/runner-enemy.png';
+
+eliteSprite.onload = () => { eliteReady = true; draw(); };
+eliteSprite.src = 'assets/elite-enemy.png';
+
+function getEnemySprite(type) {
+  if (type === 'boss') return bossSprite;
+  if (type === 'ape') return apeSprite;
+  if (type === 'stalker') return stalkerSprite;
+  if (type === 'brute') return bruteSprite;
+  if (type === 'runner') return runnerSprite;
+  if (type === 'elite') return eliteSprite;
+  return enemySprite;
+}
+
+function isEnemySpriteReady(type) {
+  if (type === 'boss') return bossReady;
+  if (type === 'ape') return apeReady;
+  if (type === 'stalker') return stalkerReady;
+  if (type === 'brute') return bruteReady;
+  if (type === 'runner') return runnerReady;
+  if (type === 'elite') return eliteReady;
+  return enemyReady;
+}
+
+function drawImageContain(sprite, x, y, boxWidth, boxHeight) {
+  const scale = Math.min(boxWidth / sprite.width, boxHeight / sprite.height);
+  const drawWidth = sprite.width * scale;
+  const drawHeight = sprite.height * scale;
+  context.drawImage(sprite, x + (boxWidth - drawWidth) / 2, y + (boxHeight - drawHeight) / 2, drawWidth, drawHeight);
+}
 
 // All character sprites use this helper: horizontal movement sets facing; vertical movement keeps it.
 function drawFacingSprite(sprite, x, y, spriteWidth, spriteHeight, facing, alpha = 1) {
@@ -471,9 +569,8 @@ function drawEnemyCodex() {
     const x = 24 + (index % 2) * (cardWidth + 10); const y = panel.y + 68 + Math.floor(index / 2) * (cardHeight + 7);
     const seen = profile.enemySeen.includes(enemy.id); const kills = profile.enemyKills[enemy.id] || 0;
     context.fillStyle = seen ? '#edf3df' : '#f2eee1'; roundedRect(x, y, cardWidth, cardHeight, 10);
-    const sprite = enemy.id === 'ape' ? apeSprite : enemy.id === 'stalker' ? stalkerSprite : enemy.id === 'boss' ? bossSprite : enemySprite;
-    const ready = enemy.id === 'ape' ? apeReady : enemy.id === 'stalker' ? stalkerReady : enemy.id === 'boss' ? bossReady : enemyReady;
-    if (seen && ready) context.drawImage(sprite, x + 8, y + 8, 48, cardHeight - 16);
+    const sprite = getEnemySprite(enemy.id);
+    if (seen && isEnemySpriteReady(enemy.id)) drawImageContain(sprite, x + 8, y + 8, 48, cardHeight - 16);
     else {
       context.fillStyle = seen ? '#9b7459' : '#c5bfaf'; context.beginPath(); context.arc(x + 32, y + cardHeight / 2, 17, 0, Math.PI * 2); context.fill();
       context.fillStyle = '#fff'; context.font = 'bold 14px sans-serif'; context.fillText(seen ? '✓' : '?', x + 32, y + cardHeight / 2 + 5);
@@ -701,6 +798,7 @@ function startGame() {
     dashY: 0,
     dashBonusDamage: 0,
     upgradeChoices: [],
+    enemyBuffPoints: 0,
     weaponEvolution: null,
     event: null,
     nextEventAt: 35 + Math.random() * 12,
@@ -819,7 +917,7 @@ function gameLoop(timestamp) {
   if (screen === 'game') updateGame(delta);
   draw();
 
-  if (screen === 'game' || screen === 'upgrade') requestAnimationFrame(gameLoop);
+  if (screen === 'game' || screen === 'upgrade' || screen === 'paused') requestAnimationFrame(gameLoop);
   else loopRunning = false;
 }
 
@@ -835,7 +933,7 @@ function spawnEnemy() {
     if (side === 3) x = game.camera.x - 30;
     x = Math.max(32, Math.min(game.worldWidth - 32, x));
     y = Math.max(90, Math.min(game.worldHeight - 32, y));
-    game.enemies.push({ x, y, type: 'boss', radius: 30, health: 300, maxHealth: 300, speed: 30, boss: true, experience: 0, facing: 1, specialTimer: 2.2, dashTimer: 0 });
+    game.enemies.push(applyCurrentEnemyBuff({ x, y, type: 'boss', radius: 30, health: 300, maxHealth: 300, speed: 30, boss: true, experience: 0, facing: 1, specialTimer: 2.2, dashTimer: 0 }));
     trackEnemySeen('boss');
     return;
   }
@@ -867,7 +965,7 @@ function spawnEnemy() {
   }[type];
   const healthScale = 1 + (wave - 1) * 0.16;
   const maxHealth = Math.round(stats.health * healthScale);
-  game.enemies.push({ x, y, ...stats, type, health: maxHealth, maxHealth, speed: stats.speed + Math.random() * 8, facing: 1 });
+  game.enemies.push(applyCurrentEnemyBuff({ x, y, ...stats, type, health: maxHealth, maxHealth, speed: stats.speed + Math.random() * 8, facing: 1 }));
   trackEnemySeen(type);
 }
 
@@ -899,7 +997,7 @@ function startRandomEvent() {
       const stats = type === 'ape'
         ? { radius: 22, health: 58, speed: 30, experience: 4, damage: 17 }
         : { radius: 14, health: 20, speed: 88, experience: 2, damage: 12 };
-      const enemy = { ...stats, x: event.x + (index ? 44 : -44), y: event.y, type, health: stats.health, maxHealth: stats.health, facing: 1, eventSerial: event.serial };
+      const enemy = applyCurrentEnemyBuff({ ...stats, x: event.x + (index ? 44 : -44), y: event.y, type, health: stats.health, maxHealth: stats.health, facing: 1, eventSerial: event.serial });
       game.enemies.push(enemy); trackEnemySeen(type);
     }
     game.plantNotice = { text: '随机事件：精英怪突袭，击败两名敌人', life: 3.5 };
@@ -997,35 +1095,46 @@ function updateGame(delta) {
   if (game.character === 'rabbit') {
     game.fireTimer -= delta;
     const target = game.enemies.reduce((nearest, enemy) => {
+      if (!isEnemyVisible(enemy)) return nearest;
       const distance = distanceBetween(enemy, player);
       return distance <= 480 && (!nearest || distance < nearest.distance) ? { enemy, distance } : nearest;
     }, null);
     if (target && game.fireTimer <= 0 && !game.victoryPending) {
       const count = Math.min(8, game.projectileCount);
+      const aimAngle = Math.atan2(target.enemy.y - player.y, target.enemy.x - player.x);
+      const scatter = game.weaponEvolution === 'scatter';
       for (let index = 0; index < count; index += 1) {
         const offset = (index - (count - 1) / 2) * 7;
-        const spreadAngle = (index - (count - 1) / 2) * 0.16;
-        const scatter = game.weaponEvolution === 'scatter';
-        game.bullets.push({ x: player.x + game.facing * 24, y: player.y - 18 + offset, vx: scatter ? game.facing * Math.cos(spreadAngle) * game.projectileSpeed : 0, vy: scatter ? Math.sin(spreadAngle) * game.projectileSpeed : 0, trajectory: scatter ? 'scatter' : 'track', damage: game.baseAttack + game.bonusAttack + game.bulletDamage, speed: game.projectileSpeed, piercesLeft: game.projectilePierce, explosive: game.weaponEvolution === 'explosion', hitEnemies: [] });
+        const spreadAngle = scatter ? (index - (count - 1) / 2) * 0.18 : 0;
+        const angle = aimAngle + spreadAngle;
+        const perpendicularX = -Math.sin(aimAngle) * offset;
+        const perpendicularY = Math.cos(aimAngle) * offset;
+        game.bullets.push({
+          x: player.x + Math.cos(aimAngle) * 24 + perpendicularX,
+          y: player.y + Math.sin(aimAngle) * 24 + perpendicularY,
+          vx: Math.cos(angle) * game.projectileSpeed,
+          vy: Math.sin(angle) * game.projectileSpeed,
+          trajectory: 'track', damage: game.baseAttack + game.bonusAttack + game.bulletDamage,
+          speed: game.projectileSpeed, piercesLeft: game.projectilePierce,
+          explosive: game.weaponEvolution === 'explosion', hitEnemies: [],
+        });
       }
       game.fireTimer = game.fireInterval;
-      burstParticles(player.x + game.facing * 25, player.y - 18, '#ffd65b', 2);
+      burstParticles(player.x + Math.cos(aimAngle) * 25, player.y + Math.sin(aimAngle) * 25, '#ffd65b', 2);
     }
     for (const bullet of game.bullets) {
       const nextTarget = game.enemies.reduce((nearest, enemy) => {
-        if (bullet.hitEnemies.includes(enemy)) return nearest;
+        if (!isEnemyVisible(enemy) || bullet.hitEnemies.includes(enemy)) return nearest;
         const distance = distanceBetween(enemy, bullet);
         return distance < 560 && (!nearest || distance < nearest.distance) ? { enemy, distance } : nearest;
       }, null);
       if (!nextTarget) { bullet.life = 0; continue; }
-      if (bullet.trajectory !== 'scatter') {
-        const dx = nextTarget.enemy.x - bullet.x;
-        const dy = nextTarget.enemy.y - bullet.y;
-        const length = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-        const turn = Math.min(1, delta * 5);
-        bullet.vx += (dx / length * bullet.speed - bullet.vx) * turn;
-        bullet.vy += (dy / length * bullet.speed - bullet.vy) * turn;
-      }
+      const dx = nextTarget.enemy.x - bullet.x;
+      const dy = nextTarget.enemy.y - bullet.y;
+      const length = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const turn = Math.min(1, delta * 5);
+      bullet.vx += (dx / length * bullet.speed - bullet.vx) * turn;
+      bullet.vy += (dy / length * bullet.speed - bullet.vy) * turn;
       bullet.previous = { x: bullet.x, y: bullet.y };
       bullet.x += bullet.vx * delta;
       bullet.y += bullet.vy * delta;
@@ -1063,7 +1172,7 @@ function updateGame(delta) {
     enemy.x = Math.max(enemy.radius, Math.min(game.worldWidth - enemy.radius, enemy.x));
     enemy.y = Math.max(enemy.radius, Math.min(game.worldHeight - enemy.radius, enemy.y));
     if (distance < player.radius + enemy.radius && game.damageCooldown <= 0 && game.dashTimer <= 0) {
-      game.health -= Math.max(1, (enemy.boss ? 16 : (enemy.damage || 10)) - game.damageReduction);
+      game.health -= Math.max(1, (enemy.damage || (enemy.boss ? 16 : 10)) - game.damageReduction);
       game.damageCooldown = 0.65;
       burstParticles(player.x, player.y - 10, '#f17a62', 7);
       playSound('hurt', 500);
@@ -1090,13 +1199,13 @@ function updateGame(delta) {
       for (let bulletIndex = game.bullets.length - 1; bulletIndex >= 0; bulletIndex -= 1) {
         const bullet = game.bullets[bulletIndex];
         const bulletDistance = bullet.previous ? distanceToSegment(enemy, bullet.previous, bullet) : distanceBetween(bullet, enemy);
-        if (bullet.hitEnemies.includes(enemy) || bulletDistance > enemy.radius + 7) continue;
+        if (!isEnemyVisible(enemy) || bullet.hitEnemies.includes(enemy) || bulletDistance > enemy.radius + 7) continue;
         enemy.health -= bullet.damage;
         hitDamage += bullet.damage;
         bullet.hitEnemies.push(enemy);
         if (bullet.explosive) {
           for (const nearby of game.enemies) {
-            if (nearby === enemy || distanceBetween(nearby, enemy) > 76) continue;
+            if (nearby === enemy || !isEnemyVisible(nearby) || distanceBetween(nearby, enemy) > 76) continue;
             const splashDamage = Math.max(1, Math.floor(bullet.damage * 0.65));
             nearby.health -= splashDamage;
             nearby.hitFlash = 0.16;
@@ -1241,17 +1350,37 @@ function chooseUpgrades() {
     ? rabbitUpgrades.concat(upgrades.filter((upgrade) => ['轻便鞋子', '收集袋', '急救包', '坚韧外衣', '疾风步'].includes(upgrade.title)))
     : upgrades).slice();
   if (!game.weaponEvolution && game.character === 'rabbit') {
-    if (game.projectileCount >= 2) options.push({ title: '武器进化：散射弹', description: '子弹改为扇形齐射，攻击范围更广', apply: () => { game.weaponEvolution = 'scatter'; game.projectileCount = Math.max(3, game.projectileCount); } });
-    if (game.bulletDamage >= 2) options.push({ title: '武器进化：爆裂弹', description: '命中后爆炸，对周围敌人造成伤害', apply: () => { game.weaponEvolution = 'explosion'; game.bulletDamage += 2; } });
-    if (game.projectilePierce >= 1) options.push({ title: '武器进化：连锁弹', description: '子弹穿透并跳向其他敌人', apply: () => { game.weaponEvolution = 'chain'; game.projectilePierce = Math.max(2, game.projectilePierce); } });
+    if (game.projectileCount >= 2) options.push({ title: '武器进化：散射弹', description: '子弹改为扇形齐射，攻击范围更广', rarity: 'gold', apply: () => { game.weaponEvolution = 'scatter'; game.projectileCount = Math.max(3, game.projectileCount); } });
+    if (game.bulletDamage >= 2) options.push({ title: '武器进化：爆裂弹', description: '命中后爆炸，对周围敌人造成伤害', rarity: 'gold', apply: () => { game.weaponEvolution = 'explosion'; game.bulletDamage += 2; } });
+    if (game.projectilePierce >= 1) options.push({ title: '武器进化：连锁弹', description: '子弹穿透并跳向其他敌人', rarity: 'gold', apply: () => { game.weaponEvolution = 'chain'; game.projectilePierce = Math.max(2, game.projectilePierce); } });
   } else if (!game.weaponEvolution && game.character === 'supreme' && (game.orbitStickCount >= 2 || game.level >= 5)) {
-    options.push({ title: '武器进化：雷电棍', description: '棍子命中时向附近敌人释放闪电', apply: () => { game.weaponEvolution = 'lightning'; } });
+    options.push({ title: '武器进化：雷电棍', description: '棍子命中时向附近敌人释放闪电', rarity: 'gold', apply: () => { game.weaponEvolution = 'lightning'; } });
   }
-  for (let index = options.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(Math.random() * (index + 1));
-    [options[index], options[swapIndex]] = [options[swapIndex], options[index]];
+
+  const chosen = [];
+  const takeRandom = (rarity) => {
+    const candidates = options.filter((upgrade) => !rarity || upgrade.rarity === rarity);
+    if (!candidates.length) return false;
+    const upgrade = candidates[Math.floor(Math.random() * candidates.length)];
+    chosen.push(upgrade);
+    options.splice(options.indexOf(upgrade), 1);
+    return true;
+  };
+  const guaranteedRarity = game.level % 10 === 0 ? 'gold' : game.level % 5 === 0 ? 'purple' : null;
+  if (guaranteedRarity) takeRandom(guaranteedRarity);
+
+  while (chosen.length < 3 && options.length) {
+    const availableRarities = [...new Set(options.map((upgrade) => upgrade.rarity))];
+    const totalWeight = availableRarities.reduce((sum, rarity) => sum + skillRarity[rarity].weight, 0);
+    let roll = Math.random() * totalWeight;
+    let rarity = availableRarities[availableRarities.length - 1];
+    for (const candidate of availableRarities) {
+      roll -= skillRarity[candidate].weight;
+      if (roll < 0) { rarity = candidate; break; }
+    }
+    takeRandom(rarity);
   }
-  return options.slice(0, 3);
+  return chosen;
 }
 
 function drawGameBackground() {
@@ -1431,9 +1560,9 @@ function drawGame() {
   for (const enemy of game.enemies) {
     const enemyX = enemy.x - game.camera.x;
     const enemyY = enemy.y - game.camera.y + (enemy.boss ? 0 : Math.sin(game.elapsed * 8 + enemy.x * 0.01) * 1.5);
-    const specialSprite = enemy.type === 'ape' ? apeSprite : enemy.type === 'stalker' ? stalkerSprite : null;
-    const specialReady = enemy.type === 'ape' ? apeReady : enemy.type === 'stalker' ? stalkerReady : false;
-    if ((enemy.boss && !bossReady) || (!enemy.boss && !specialReady && !enemyReady)) {
+    const enemySpriteForType = getEnemySprite(enemy.type);
+    const spriteReady = isEnemySpriteReady(enemy.type);
+    if (!spriteReady) {
       context.beginPath();
       context.fillStyle = enemy.hitFlash > 0 ? '#fff0a6'
         : enemy.boss ? '#764b82'
@@ -1464,12 +1593,10 @@ function drawGame() {
       context.fillRect(enemyX + 7, enemyY - 3, 3, 5);
     } else if (enemy.boss) {
       drawFacingSprite(bossSprite, enemyX, enemyY - 2, 110, 140, enemy.facing || 1, enemy.hitFlash > 0 ? 0.72 : 1);
-    } else if (specialReady) {
-      const spriteWidth = enemy.radius * 2.25; const spriteHeight = enemy.radius * 3.05;
-      drawFacingSprite(specialSprite, enemyX, enemyY - spriteHeight * 0.32, spriteWidth, spriteHeight, enemy.facing || 1, enemy.hitFlash > 0 ? 0.72 : 1);
-    } else if (enemyReady) {
-      const spriteSize = enemy.radius * 2.6;
-      drawFacingSprite(enemySprite, enemyX, enemyY, spriteSize, spriteSize, enemy.facing || 1, enemy.hitFlash > 0 ? 0.7 : 1);
+    } else if (spriteReady) {
+      const spriteHeight = enemy.radius * (enemy.type === 'runner' ? 2.8 : 3.05);
+      const spriteWidth = spriteHeight * enemySpriteForType.width / enemySpriteForType.height;
+      drawFacingSprite(enemySpriteForType, enemyX, enemyY - spriteHeight * 0.32, spriteWidth, spriteHeight, enemy.facing || 1, enemy.hitFlash > 0 ? 0.72 : 1);
     } else {
       context.fillStyle = '#fff4d2';
       context.fillRect(enemyX - 5, enemyY - 3, 3, 3);
@@ -1480,9 +1607,13 @@ function drawGame() {
       context.fillStyle = '#fff4d2';
       context.font = 'bold 11px sans-serif';
       context.fillText('首领', enemyX, enemyY - (bossReady ? 88 : enemy.radius + 15));
-      drawBar(enemyX - 42, enemyY - (bossReady ? 78 : enemy.radius + 11), 84, 6, enemy.health, enemy.maxHealth, '#e25758');
-    } else {
-      drawBar(enemyX - enemy.radius, enemyY - enemy.radius - 9, enemy.radius * 2, 4, enemy.health, enemy.maxHealth, '#d7564e');
+    }
+    if (enemy.health < enemy.maxHealth) {
+      const spriteHeight = enemy.boss ? 140 : enemy.radius * (enemy.type === 'runner' ? 2.8 : 3.05);
+      const hasSprite = enemy.boss ? bossReady : spriteReady;
+      const barY = enemyY - (hasSprite ? spriteHeight * 0.82 : enemy.radius) - 9;
+      const barWidth = enemy.boss ? 84 : Math.max(30, enemy.radius * 2);
+      drawBar(enemyX - barWidth / 2, barY, barWidth, enemy.boss ? 6 : 4, enemy.health, enemy.maxHealth, '#d7564e');
     }
   }
 
@@ -1586,19 +1717,15 @@ function drawGame() {
   context.fillStyle = '#9b7435';
   context.fillText(`种子 +${game.seedsEarned}`, width / 2, 66);
   drawBar(28, 78, width - 56, 8, game.experience, game.experienceNeeded, '#e9b84f');
+  const currentEnemyBuff = getEnemyBuffMultipliers();
+  context.textAlign = 'center'; context.fillStyle = '#a45b42'; context.font = '10px sans-serif';
+  context.fillText(`怪物强化 速+${Math.round((currentEnemyBuff.speed - 1) * 100)}% · 伤+${Math.round((currentEnemyBuff.damage - 1) * 100)}% · 血+${Math.round((currentEnemyBuff.health - 1) * 100)}%`, width / 2, 99);
   settleButton = { x: 12, y: 108, width: 64, height: 30 };
   context.fillStyle = 'rgba(49, 94, 55, 0.92)'; roundedRect(settleButton.x, settleButton.y, settleButton.width, settleButton.height, 9);
-  context.fillStyle = '#fff7d9'; context.font = 'bold 12px sans-serif'; context.textAlign = 'center'; context.fillText('结算', settleButton.x + settleButton.width / 2, settleButton.y + 20);
+  context.fillStyle = '#fff7d9'; context.font = 'bold 12px sans-serif'; context.textAlign = 'center'; context.fillText('暂停', settleButton.x + settleButton.width / 2, settleButton.y + 20);
 
   const boss = game.enemies.find((enemy) => enemy.boss);
-  if (boss) {
-    context.textAlign = 'center';
-    context.fillStyle = '#fff7d9';
-    context.font = 'bold 13px sans-serif';
-    context.fillText('首领', width / 2, 124);
-    const bossBarWidth = Math.min(150, width * 0.38);
-    drawBar(width / 2 - bossBarWidth / 2, 132, bossBarWidth, 8, boss.health, boss.maxHealth, '#d7564e');
-  } else if (game.waveNotice > 0) {
+  if (!boss && game.waveNotice > 0) {
     context.textAlign = 'center';
     context.fillStyle = 'rgba(49, 94, 55, 0.88)';
     roundedRect(width / 2 - 88, 112, 176, 38, 12);
@@ -1641,11 +1768,30 @@ function drawGame() {
   drawMiniMap();
 }
 
+function drawPause() {
+  drawGame();
+  context.fillStyle = 'rgba(24, 47, 29, 0.72)';
+  context.fillRect(0, 0, width, height);
+  context.textAlign = 'center';
+  context.fillStyle = '#fff7d9';
+  context.font = 'bold 28px sans-serif';
+  context.fillText('游戏暂停', width / 2, height * 0.34);
+  [
+    { y: height * 0.44, label: '继续游戏', color: '#477a3c' },
+    { y: height * 0.55, label: '立马结算', color: '#b9654e' },
+  ].forEach((button) => {
+    context.fillStyle = button.color;
+    roundedRect(width * 0.18, button.y, width * 0.64, 52, 14);
+    context.fillStyle = '#fff7d9';
+    context.font = 'bold 18px sans-serif';
+    context.fillText(button.label, width / 2, button.y + 33);
+  });
+}
+
 function upgradeCardBounds(index) {
-  const cardHeight = 96;
-  const gap = 12;
-  const totalHeight = cardHeight * 3 + gap * 2;
-  return { x: 22, y: (height - totalHeight) / 2 + index * (cardHeight + gap), width: width - 44, height: cardHeight };
+  const cardHeight = 104;
+  const gap = 8;
+  return { x: 22, y: height * 0.30 + index * (cardHeight + gap), width: width - 44, height: cardHeight };
 }
 
 function drawUpgrade() {
@@ -1664,16 +1810,20 @@ function drawUpgrade() {
     context.fillStyle = '#fff7d9';
     roundedRect(card.x, card.y, card.width, card.height, 14);
     context.textAlign = 'left';
-    context.fillStyle = '#315e37';
-    context.font = 'bold 19px sans-serif';
-    context.fillText(upgrade.title, card.x + 18, card.y + 38);
+    const rarity = skillRarity[upgrade.rarity];
+    context.fillStyle = rarity.color;
+    context.font = 'bold 17px sans-serif';
+    context.fillText(`${rarity.label} · ${upgrade.title}`, card.x + 18, card.y + 29, card.width - 36);
     context.fillStyle = '#6b7956';
-    context.font = '14px sans-serif';
-    context.fillText(upgrade.description, card.x + 18, card.y + 66);
+    context.font = '13px sans-serif';
+    context.fillText(upgrade.description, card.x + 18, card.y + 52, card.width - 36);
+    context.fillStyle = '#a45b42';
+    context.font = '10px sans-serif';
+    context.fillText(enemyBuffDescription(upgrade.rarity), card.x + 18, card.y + 76, card.width - 36);
     context.textAlign = 'right';
     context.fillStyle = '#b37c2e';
-    context.font = 'bold 14px sans-serif';
-    context.fillText('选择 ›', card.x + card.width - 16, card.y + 54);
+    context.font = 'bold 12px sans-serif';
+    context.fillText('选择 ›', card.x + card.width - 16, card.y + 96);
   });
 }
 
@@ -1809,7 +1959,11 @@ function handleTouchStart(event) {
 
   if (screen === 'game') {
     if (settleButton && touch.clientX >= settleButton.x && touch.clientX <= settleButton.x + settleButton.width && touch.clientY >= settleButton.y && touch.clientY <= settleButton.y + settleButton.height) {
-      game.earlySettled = true; finishGame(false); draw(); return;
+      game.input = { x: 0, y: 0 };
+      joystickTouchId = null;
+      joystickOrigin = null;
+      screen = 'paused';
+      draw(); return;
     }
     if (isDashButtonHit(touch)) { activateDash(); return; }
     if (joystickTouchId !== null) return;
@@ -1819,11 +1973,25 @@ function handleTouchStart(event) {
     return;
   }
 
+  if (screen === 'paused') {
+    if (touch.clientX >= width * 0.18 && touch.clientX <= width * 0.82 && touch.clientY >= height * 0.44 && touch.clientY <= height * 0.44 + 52) {
+      screen = 'game';
+      lastFrameTime = 0;
+      startLoop();
+    } else if (touch.clientX >= width * 0.18 && touch.clientX <= width * 0.82 && touch.clientY >= height * 0.55 && touch.clientY <= height * 0.55 + 52) {
+      game.earlySettled = true;
+      finishGame(false);
+    }
+    draw();
+    return;
+  }
+
   if (screen === 'upgrade') {
     game.upgradeChoices.forEach((upgrade, index) => {
       const card = upgradeCardBounds(index);
       if (touch.clientX >= card.x && touch.clientX <= card.x + card.width && touch.clientY >= card.y && touch.clientY <= card.y + card.height) {
         upgrade.apply();
+        applyEnemyBuff(upgrade.rarity);
         screen = 'game';
       }
     });
@@ -1860,6 +2028,7 @@ function handleTouchEnd(event) {
 function draw() {
   if (screen === 'menu') drawMenu();
   else if (screen === 'game') drawGame();
+  else if (screen === 'paused') drawPause();
   else if (screen === 'upgrade') drawUpgrade();
   else if (screen === 'result') drawResult();
   else if (screen === 'wardrobe') drawWardrobe();
