@@ -1,5 +1,105 @@
 const canvas = wx.createCanvas();
 const context = canvas.getContext('2d');
+
+// ---- 性能自测（游戏自己报帧率） -------------------------------------------------------
+// 背景：微信开发者工具的 Performance 面板不是谁都看得见、也不一定连得上真机调试。
+// 所以把「看不看得到帧率」这件事从工具链里拿出来，改成游戏自己数：
+//   ① 战斗 HUD 上可以开一个浮层（右上角时间区域连点 3 下），实时显示 FPS / 帧耗时 / 实体数
+//   ② 结算页永远附一行性能摘要，一局打完就能看到，不需要任何工具
+//   ③ 开浮层时每 2 秒往 console 打一行，真机调试/远程调试可以直接抄
+// 只统计 rAF 间隔与实体数，**不给 context 方法套计数器** —— 那种包装在每帧上千次调用下
+// 自己就会拖慢 1~2ms，测出来的数不可信。绘制调用数在无头侧由 tools/draw-budget.mjs 统计。
+const perf = {
+  fps: 0,
+  frameMs: 0,
+  frameMsMax: 0,
+  peakEntities: 0,
+  visible: false,
+  sampleStart: 0,
+  sampleFrames: 0,
+  sampleMs: 0,
+  lastFrameAt: 0,
+  lastLogAt: 0,
+  runFrames: 0,
+  runMsSum: 0,
+  taps: 0,
+  tapAt: 0,
+};
+
+function perfEntityCount() {
+  if (!game) return 0;
+  return (game.enemies ? game.enemies.length : 0)
+    + (game.bullets ? game.bullets.length : 0)
+    + (game.radialBullets ? game.radialBullets.length : 0)
+    + (game.swordWaves ? game.swordWaves.length : 0)
+    + (game.particles ? game.particles.length : 0)
+    + (game.damageNumbers ? game.damageNumbers.length : 0);
+}
+
+function resetPerf() {
+  perf.fps = 0;
+  perf.frameMs = 0;
+  perf.frameMsMax = 0;
+  perf.peakEntities = 0;
+  perf.sampleStart = 0;
+  perf.sampleFrames = 0;
+  perf.sampleMs = 0;
+  perf.lastFrameAt = 0;
+  perf.lastLogAt = 0;
+  perf.runFrames = 0;
+  perf.runMsSum = 0;
+}
+
+// 每帧调用一次：用 rAF 间隔当帧耗时（这就是玩家感受到的帧率）。
+// 0.5 秒汇总一次 fps，最差帧与实体峰值是整局累计（结算页要用）。
+function notePerfFrame(timestamp) {
+  const entities = perfEntityCount();
+  if (entities > perf.peakEntities) perf.peakEntities = entities;
+  if (perf.lastFrameAt) {
+    const frameMs = Math.min(1000, timestamp - perf.lastFrameAt);
+    perf.sampleMs += frameMs;
+    perf.sampleFrames += 1;
+    perf.runFrames += 1;
+    perf.runMsSum += frameMs;
+    if (frameMs > perf.frameMsMax) perf.frameMsMax = frameMs;
+    const span = timestamp - perf.sampleStart;
+    if (span >= 500) {
+      perf.fps = Math.round((perf.sampleFrames * 1000) / span);
+      perf.frameMs = Math.round(perf.sampleMs / perf.sampleFrames);
+      perf.sampleStart = timestamp;
+      perf.sampleFrames = 0;
+      perf.sampleMs = 0;
+    }
+  } else {
+    perf.sampleStart = timestamp;
+  }
+  perf.lastFrameAt = timestamp;
+  if (perf.visible && timestamp - perf.lastLogAt >= 2000) {
+    perf.lastLogAt = timestamp;
+    console.log(`[perf] fps=${fmtInt(perf.fps)} frame=${fmtInt(perf.frameMs)}ms worst=${fmtInt(perf.frameMsMax)}ms entities=${fmtInt(perf.peakEntities)}`);
+  }
+}
+
+// 纯数据：浮层上显示的两行文字（测试直接断言这两行不含小数点）。
+function perfLines() {
+  return [
+    `FPS ${fmtInt(perf.fps)} · 帧 ${fmtInt(perf.frameMs)}ms`,
+    `最差 ${fmtInt(perf.frameMsMax)}ms · 实体 ${fmtInt(perf.peakEntities)}`,
+  ];
+}
+
+// 右上角时间区域：连点 3 下（1.5 秒内）切换浮层。
+function perfToggleBounds() {
+  return { x: width - 92, y: viewInsets.top + HUD_TOP_GAP + 30, width: 80, height: 26 };
+}
+
+function togglePerfOverlay(now) {
+  perf.visible = !perf.visible;
+  perf.taps = 0;
+  perf.tapAt = 0;
+  if (perf.visible) perf.lastLogAt = 0;
+  draw();
+}
 const system = wx.getSystemInfoSync();
 const background = wx.createImage();
 const characterSprite = wx.createImage();
@@ -19,8 +119,67 @@ const xiaoxianSprite = wx.createImage();
 // 奶小仙的武器伞：所有攻击形态（掷出/飞行/旋转/回程/伞爆）共用这一张。
 // 素材由用户提供（原图白底，已用"从图像边缘向内的连通域"法去背，见 README 素材规格一节）。
 const umbrellaSprite = wx.createImage();
+// 界面烘焙贴图：panel9 是九宫格面板（角 64/192），grain 是 256 无缝纸纹，glow 是加法发光。
+// 三者都来自构建期脚本，源码级参数见 团队工作区/reports/界面UI/tools/bake-shaders.py。
+const uiPanelSprite = wx.createImage();
+const uiGrainSprite = wx.createImage();
+const uiWashSprite = wx.createImage();
+const uiVignetteSprite = wx.createImage();
+const fxGlowSprite = wx.createImage();
+// 氛围粒子（用户 2026-10-23 提供原图，白底/黑底已抠成透明，见 reports/色彩/tools/prepare-particles.py）。
+// petal/leaf 正常混合；firefly/dust 用 lighter 叠加，暗场才有发光感。
+// 战斗地面：底图（1024 无缝草地，镜像法生成）+ 装饰层（640 透明，程序拼合）+ 4 个装饰件，
+// 全部来自用户 2026-10-23 提供的素材，处理脚本 reports/色彩/tools/prepare-bg-assets.py。
+// 主菜单 key art（用户 2026-10-23 生成：光圈 + 云海 + 石阶 + 四个团子）。
+// 加载失败时 drawMenu 会退回原来的 background（春日草地），不会空屏。
+const menuKeyartSprite = wx.createImage();
+let menuKeyartReady = false;
+const groundSprite = wx.createImage();
+const groundDetailSprite = wx.createImage();
+const decorSprites = { flowers: wx.createImage(), stones: wx.createImage(), fence: wx.createImage(), puddle: wx.createImage() };
+const decorReady = { flowers: false, stones: false, fence: false, puddle: false };
+let groundReady = false;
+let groundDetailReady = false;
+
+const ambientSprites = {
+  petal: wx.createImage(),
+  leaf: wx.createImage(),
+  firefly: wx.createImage(),
+  dust: wx.createImage(),
+};
+const ambientReady = { petal: false, leaf: false, firefly: false, dust: false };
 
 let screen = 'menu';
+// 主菜单交互状态：选中角色 / 侧边栏展开 / 小屏抽屉 / 图标名称气泡
+let menuPick = null;
+let menuSidebarExpanded = false;
+let menuDrawerOpen = false;
+let menuTip = null;
+// 技能图鉴：滚动偏移、详情弹层、拖动起点（纯 GUI 状态）
+let skillCodexScroll = 0;
+let skillCodexDetail = null;
+let codexDragY = null;
+// 详情弹层的横向滑动：起点 X / 当前位移 / 用于区分「滑动」与「点一下关闭」
+let codexSwipeStartX = null;
+let codexSwipeStartY = null;
+let codexSwipeX = 0;
+// 传送门：按下后的白光过渡起点（0 = 没有过渡）
+let portalTransitionAt = -1;  // 过场起点（2 秒：只留主背景 → 白光铺满）；-1 = 无过场
+let portalSwitchAt = 0;       // 真正切到战斗的帧标记（一次性）
+let portalGuideAt = 0;
+
+function enterMenu() {
+  clearAim();
+  screen = 'menu';
+  menuSidebarExpanded = false;
+  menuDrawerOpen = false;
+  menuTip = null;
+  // 默认预选上次出战角色（只亮光晕，不弹机制卡）
+  menuPick = { id: profile.character, since: 0, confirmed: true };
+  // 首局引导：没看过就亮箭头（第一次从传送门进入后写档，不再出现）
+  portalGuideAt = profile.portalGuideDone ? 0 : Date.now();
+  portalTransitionAt = -1;
+}
 let width = system.screenWidth;
 let height = system.screenHeight;
 let pixelRatio = system.pixelRatio || 1;
@@ -40,10 +199,18 @@ let eliteReady = false;
 let daxiaReady = false;
 let xiaoxianReady = false;
 let umbrellaReady = false;
+// 构建期烘焙出来的界面贴图（tools/bake-shaders.py 生成，运行期只有 drawImage）
+let uiPanelReady = false;
+let uiGrainReady = false;
+let uiWashReady = false;
+let uiVignetteReady = false;
+let fxGlowReady = false;
 let game = null;
 let skillCodexCharacter = 'supreme';
 let upgradeDetailIndex = 0;
+let statsReturnScreen = 'upgrade';
 let joystickTouchId = null;
+let skillTouchId = null;   // 技能键的触点 id（与摇杆分开，支持双指）
 let joystickOrigin = null;
 let loopRunning = false;
 let lastFrameTime = 0;
@@ -53,13 +220,13 @@ let lastFrameTime = 0;
 const profileStorageKey = 'yard-cleaner-profile-v1';
 const characters = [
   { id: 'supreme', name: '至尊奶', style: '旋转棍', description: '环绕近战' },
-  { id: 'rabbit', name: '瘦嘟嘟', style: '追踪枪', description: '自动追踪射击' },
+  { id: 'rabbit', name: '瘦嘟嘟', style: '直射枪', description: '固定弹道' },
   { id: 'daxia', name: '奶大侠', style: '月牙刀光', description: '穿透渐衰' },
   { id: 'xiaoxian', name: '奶小仙', style: '掷伞', description: '持续压制' },
 ];
 const characterCodices = {
   supreme: '棍法专精 · 环绕棍环绕自身持续输出',
-  rabbit: '枪械专精 · 追踪子弹自动锁定敌人',
+  rabbit: '枪械专精 · 子弹直线飞行，命中消失；长按手雷可 0.1x 瞄准落点',
   daxia: '刀法专精 · 刀光穿透后不消失，越打越衰',
   xiaoxian: '御伞专精 · 伞离手时靠反刺玉衣自保',
 };
@@ -161,6 +328,82 @@ function clampProfileNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, number));
 }
 
+// ---- 界面令牌（新写代码只走这里；存量色字面量见 团队工作区/reports/界面UI/01-设计方案.md §2.1）
+// 这不是重构：208 个存量色值一次性替换会产出 208 行 diff，风险远大于收益。规则是
+// 「新增代码不许再出现裸色值」，存量随改动自然收敛。
+const UI = {
+  ink: '#22331f',          // 主文字：比 #274d2e 更深，压白底/画面上都稳
+  inkSoft: '#3f5741',      // 次级文字（属性名、说明）
+  leaf: '#2f6b3a',         // 主绿：按钮/强调文字
+  leafLight: '#4b8a44',    // 亮绿：hover/选中
+  leafDeep: '#1f4a2c',     // 深绿：描边/深色按钮
+  moss: '#5f7352',         // 弱化文字（提示、标签）
+  cream: '#fff8e3',        // 绿底上的文字
+  paper: 'rgba(255, 250, 226, 0.94)',
+  paperSolid: '#fffaf0',
+  scrim: 'rgba(20, 34, 24, 0.72)',
+  gold: '#d29b3a',
+  amber: '#8a6a33',
+  amberDark: '#b07a2b',
+  hp: '#d76c54',
+  xp: '#e9b84f',
+  danger: '#b5543d',
+  warn: '#ffcf7a',
+  grass: '#87ae66',
+  blood: '#b3202e',
+  track: 'rgba(31, 57, 35, 0.28)',
+  board: '#e8d7a9',
+  boardMuted: 'rgba(232, 215, 169, 0.55)',
+  leafButton: 'rgba(47, 107, 58, 0.92)',
+  leafButtonDim: 'rgba(47, 107, 58, 0.42)',
+  leafChip: 'rgba(47, 107, 58, 0.78)',
+  dangerChip: 'rgba(181, 84, 61, 0.92)',
+  cardTop: '#ffffff',
+  cardShadow: 'rgba(30, 48, 32, 0.24)',
+  cardEdge: 'rgba(34, 58, 38, 0.88)',
+  glass: 'rgba(255, 250, 240, 0.82)',   // 半透明面板（左侧栏抽屉）
+  // 冲刺瞄准（0.1x 时缓）
+  aimDim: 'rgba(206, 210, 203, 0.34)',
+  aimEdge: 'rgba(12, 22, 14, 0.18)',
+  aimLine: 'rgba(255, 250, 226, 0.55)',
+  aimCream: 'rgba(255, 250, 226, 0.95)',
+  aimGold: 'rgba(255, 215, 94, 0.95)',
+  aimGoldStroke: 'rgba(255, 215, 94, 0.9)',
+  aimBadge: 'rgba(20, 30, 22, 0.82)',
+  aimLabel: '#ffd75e',
+  glassEdge: 'rgba(34, 58, 38, 0.55)',        // 半透明面板描边
+  glassIcon: 'rgba(255, 250, 240, 0.72)',
+  burstCore: 'rgba(255, 255, 255, 0.98)',
+  burstMid: 'rgba(255, 248, 224, 0.92)',
+  burstEdge: 'rgba(255, 248, 224, 0)',
+  dashCyan: '#8fe6e9',
+  dashGold: '#ffe7a8',
+  dashLine: 'rgba(143, 230, 233, 0.5)',
+  dashRing: 'rgba(143, 230, 233, 0.85)',
+  textHalo: 'rgba(255, 252, 240, 0.86)',   // 画面上文字的白描边
+  textShadow: 'rgba(24, 38, 26, 0.35)',    // 画面上文字的柔影
+  creamMuted: 'rgba(255, 248, 227, 0.72)',
+  // 形状阶梯：标签 8 / 卡片 12 / 按钮 16 / 面板 22
+  radius: { chip: 8, card: 12, button: 16, panel: 22 },
+  // 间距阶梯（4 的倍数）
+  gap: { xs: 4, sm: 8, md: 12, lg: 16, xl: 20 },
+};
+
+// ---- 数字显示 ----------------------------------------------------------------
+// 规则（README「界面与数字」一节）：界面上出现的数字一律不带小数。
+//   fmtInt      四舍五入 —— 属性、伤害、数量、倍率
+//   fmtCeil     向上取整 —— 倒计时、以及「小到取整就变 0」的增量，宁可多给 1 也不能显示 0
+//   fmtPercent  比例 → 整数百分比
+// 为什么不直接 toFixed(0)：toFixed 对负数与 .5 的处理容易出 -0，而且它让字符串里仍然
+// 留着小数点；Math.round + String() 只有一种行为，可被 tools/verify.mjs A7 静态断言。
+function numOrZero(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+function fmtInt(value) { return String(Math.round(numOrZero(value))); }
+function fmtCeil(value) { return String(Math.ceil(numOrZero(value))); }
+function fmtPercent(ratio) { return `${Math.round(numOrZero(ratio) * 100)}%`; }
+
 function createDefaultProfile() {
   const garden = {};
   gardenProjects.forEach((item) => { garden[item.id] = 0; });
@@ -170,6 +413,10 @@ function createDefaultProfile() {
     version: PROFILE_SCHEMA_VERSION,
     bestTime: 0,
     bestKills: 0,
+    // 首局引导是否已完成：只影响提示，不影响任何数值
+    tutorialDone: false,
+    // 传送门首次引导是否看过：只影响提示，不影响任何数值
+    portalGuideDone: false,
     coins: 0,
     seeds: 0,
     character: 'supreme',
@@ -261,6 +508,8 @@ function normalizeProfile(saved) {
     version: PROFILE_SCHEMA_VERSION,
     bestTime: clampProfileNumber(migrated.bestTime, 0, Number.MAX_SAFE_INTEGER, 0),
     bestKills: clampProfileNumber(migrated.bestKills, 0, 10e6, 0),
+    tutorialDone: migrated.tutorialDone === true,
+    portalGuideDone: migrated.portalGuideDone === true,
     // 上限 1e12：既挡住 1e300 / Infinity 这类被手改出来的天文数字，又远高于任何正常玩法收益。
     coins: clampProfileNumber(migrated.coins, 0, 1e12, 0),
     seeds: clampProfileNumber(migrated.seeds, 0, 1e12, 0),
@@ -303,15 +552,33 @@ const balance = {
   startingOrbitRadius: 60,
   startingOrbitSpeed: 2.8,
   startingStickHalfLength: 35,
+  // ---- 至尊奶棍阵上限与平衡（2026-10-24 方案）-----------------------------------
+  orbitStickCap: 8,              // 硬上限：再多也只按 8 根算（溢出转攻击）
+  orbitStickSoftCap: 5,          // 软上限：5 根以内 100% 效率
+  orbitStickOverflowEfficiency: 0.6, // 6~8 根每根只算 60%
+  orbitStickOverflowAttack: 2,   // 达到硬上限后，每张「棍子 +N」改为 +2 攻击/根
+  normalHitHealthCap: 0.34,      // 非首领单次棍击 ≤ 最大生命 34% → 至少 3 击
+  armorBreakMax: 3,              // 破甲层数上限
+  armorBreakBossMax: 2,          // 首领破甲上限
+  armorBreakDamage: 0.12,        // 每层 +12% 受伤
+  armorBreakLife: 2.5,
+  stickPityEveryLevels: 5,       // 每 5 级自动 +1 棍（数值保底）
+  offenseDroughtMax: 3,          // 连续 3 级无输出卡 → 下一级必出输出卡
   startingAttackRange: 480,
   startingCritChance: 0.05,
   startingCritMultiplier: 1.5,
   startingKnockback: 1,
   startingFireInterval: 0.60,
-  startingProjectileSpeed: 430,
+  startingProjectileSpeed: 480,
   startingProjectileTurnRate: 5,
   startingGrenadeRadius: 104,
   grenadeFlightDuration: 0.68,
+  grenadeThrowRange: 420,      // 长按瞄准的最大投掷距离（屏幕 px）
+  grenadeThrowMin: 90,         // 最近落点距离
+  grenadeDragGain: 1.2,        // 拖动 → 落点距离
+  grenadeOverdragRatio: 1.5,   // 拖出 1.5×所需行程 = 取消
+  grenadeLockRadius: 28,       // 落点圈吸附敌人的半径
+  grenadeLockKeepRadius: 40,   // 锁定滞回
   grenadeNormalRatio: 0.3,
   grenadeBossRatio: 0.1,
   grenadeCooldown: 10,
@@ -331,9 +598,42 @@ const balance = {
   grenadeBossStunScale: 0.35,
   grenadeExplosionLife: 0.55,
   grenadeScorchLife: 3.4,
-  dashCooldown: 4.5,
-  dashDuration: 0.22,
-  dashSpeedFactor: 4.2,
+  dashCooldown: 4.5,            // 仅其他角色/旧字段兼容；至尊奶改走充能
+  dashRecharge: 4.5,            // 每格充能回复时间
+  dashChargeMaxBase: 2,         // 基础充能上限
+  dashChargeMaxCap: 4,          // 红卡 +1、棍子≥6 +1 之后的上限
+  dashStickChargeThreshold: 6,  // 棍子到这个数量再 +1 充能上限
+  dashDuration: 0.26,          // v2：0.22 → 0.26，多 0.04s 才「穿得过去」
+  dashSpeedFactor: 4.6,        // v2：4.2 → 4.6，位移 +18%
+  // ---- 冲刺 v2「棍影冲刺」 -------
+  dashInvulnExtra: 0.08,       // 冲刺结束后额外无敌，让「撞进去再出来」可感知
+  dashStun: 0.25,              // 命中眩晕（boss 打五折，与手雷同口径）
+  dashBossStunScale: 0.5,
+  dashKnockbackScale: 1.8,     // 击退倍率（方向仍是冲刺方向）
+  dashStickBonusMax: 2,        // 「棍势」最多 +2 根
+  dashStickBonusLife: 4,       // 棍势持续 4 秒
+  dashHitStop: 0.04,           // 首次命中顿帧
+  dashShakePower: 4,
+  dashShakeTime: 0.16,
+  dashGhostMax: 3,             // 残影数量上限
+  dashGhostLife: 0.22,
+  dashGhostInterval: 0.05,
+  dashReadyPulse: 0.35,        // 冷却好时技能键脉冲时长
+  // ---- 冲刺瞄准 v3（长按 0.1x 时缓 + 拖动锁定） --------------------------------
+  aimSlowFactor: 0.1,          // 瞄准时世界与玩家统一 0.1x；无时长上限（角色常驻机制）
+  aimHoldMs: 180,              // 按住多久进入瞄准（更短 = 快速冲刺）
+  aimLockRadius: 28,           // 准星多近锁定敌人（用户选 28，后续可调）
+  aimLockKeepRadius: 40,       // 离开当前目标多远才换目标（滞回）
+  aimCancelRadius: 20,         // 拖回技能键多近松手 = 取消
+  moveMemoryMs: 1200,          // 方向记忆：松手后 1.2 秒内仍用最后移动方向
+  moveMemoryMinInput: 0.25,
+  // ---- 冲刺距离 = 箭头长度（v2）----
+  dashSnapTiers: [0.4, 0.7, 1],   // 三档吸附：40% / 70% / 100%
+  dashSnapWindow: 12,             // 进入吸附窗口（屏幕 px）
+  dashSnapHysteresis: 6,          // 离开吸附档位需要的额外距离
+  dashOverdragRatio: 1.5,         // 拖出 1.5 倍上限 = 取消 // 只有输入强度 ≥0.25 才记录记忆方向
+  dashSpinLife: 2,              // 回旋余劲：冲刺后转速加成持续时间
+  dashSpinBonus: 0.4,
   contactDamageCooldown: 0.65,
   plantSpawnFirst: 10,
   eventFirstAt: 35,
@@ -356,7 +656,10 @@ const balance = {
   // small rarities were flattened to a near-flat slope (1.0 / 1.04 / 1.06) to keep the total
   // curve in a playable band. Measured over a fixed 30-upgrade path the effective monster HP
   // grows x447 (was x198), against player damage growth of x217 (supreme) / x924 (rabbit).
-  enemyHealthMultiplier: { white: 1.0, blue: 1.04, purple: 1.06, gold: 4.0, red: 10.0 },
+  // 4 张金卡就把敌人血量顶到 ×128，而玩家伤害乘区只有 ~17 倍 —— 这是「中后期打不动」的真正原因。
+  // 下调到 ×2.0/×4.0、上限 ×16：4 张金卡封顶；玩家乘区（18 金 + 1 红 ≈ 20 倍）压过上限，
+  // 所以中后期打得动，而杂兵仍然是「扫过就死」（压力交给精英与首领）。
+  enemyHealthMultiplier: { white: 1.0, blue: 1.04, purple: 1.06, gold: 2.4, red: 5.0 },
   enemyHealthFlat: { white: 2, blue: 4, purple: 7, gold: 12, red: 24 },
   // The x4 / x7 step lands the instant the skill is picked, while the player's compensating
   // power arrives over the following level-ups. Left fully uncapped, a run that draws several
@@ -366,7 +669,7 @@ const balance = {
   // unusually lucky runs; past it, further gold/red picks keep paying out as a BIGGER HORDE
   // (surgePerGold / surgePerRed) rather than as monsters that take forever to chew through.
   // Set to Infinity to restore the raw uncapped x4 / x7 behaviour.
-  enemyHealthMultiplierCap: 128,
+  enemyHealthMultiplierCap: 28,
   // Every gold/red pick also swells the horde: a bigger on-screen ceiling plus an immediate
   // burst around the player, so the reward for a strong pick is more things to cut down.
   surgePerGold: 5,
@@ -378,12 +681,26 @@ const balance = {
   // Weight used to climb ~2.1 per level while knockback climbed 1, so the push
   // ratio converged below its activation threshold and knockback silently died.
   enemyWeightStep: { white: 0.5, blue: 1.0, purple: 1.5, gold: 2.0, red: 3.0 },
-  waveHealthCompound: 0.14,
+  waveHealthCompound: 0.16,   // 0.14 → 0.16：波 20 血量 +65%，前期几乎不变（平衡方案 A/G）
   // Knockback redesign. The old numbers made the push physically real but visually absent:
   // maxDistance sat only ~50 px beyond the standoff ring, so even a fully invested build moved
   // enemies about 25 px - roughly one body width - and at 520 px/s that push was over in two
   // frames. The push is now much longer and slower so it actually reads on screen.
   knockbackMaxDistance: 140,
+  // ---- 击退抗性（防止「击退 build = 无敌墙」）------------------------------------
+  // 同一只怪被连续击退时抗性累积、不挨打时衰减；首领直接免疫击退。
+  // 没有这条时，至尊奶的棍阵会每 0.22 秒刷一次 stagger(0.16~0.32s)，敌人永远「正在被击退」，
+  // 于是既不移动也进不了接触范围 —— 高棍数 = 物理免疫（用户 2026-10-22 指出）。
+  knockbackGuardStep: 0.3,
+  knockbackGuardMax: 0.8,    // 0.95 → 0.8：击退不再被完全吃掉，破甲才是长期收益
+  knockbackGuardDecay: 0.8,
+  // ---- 首领战（用玩家近期 DPS 反推血量，保证任何 build 都是「一场战斗」）----------
+  bossFightSeconds: 24,
+  // 上限放到 2000 万：greedy 后期总 DPS 实测可达 150 万/秒（18 金 + 40 级），
+  // 血上限设小了等于「按玩家 DPS 算完又被上限截断」——首领照样被秒。
+  bossHealthMax: 20000000,
+  // 单次伤害上限（占最大生命比例）：再高的爆发也不能一刀秒，至少 7 刀。
+  bossHitCap: 0.5,
   knockbackPushSpeed: 320,
   slamDamageRatio: 0.8,
   slamKnockbackRatio: 2.5,
@@ -391,16 +708,9 @@ const balance = {
   slamSelfRatio: 0.25,
   slamImpactRadius: 62,
   // Feel / juice
-  // Bullet readability. A tracking bullet that loses its target used to be deleted on the
-  // spot (life = 0), which read as the shot blinking out of existence. It now coasts on its
-  // last heading and fades out instead.
-  bulletLifetime: 1.2,
+  bulletRangeRatio: 1.15,   // 直线弹道射程 = 攻击距离 × 1.15
+  bulletHitGrace: 2,        // 直线更容易擦边，命中半径 +2px
   bulletFadeTime: 0.3,
-  // Bullets used to re-target anything within attackRange + 80 (up to 800 px, wider than the
-  // screen), so they streaked across the whole view chasing something off-camera. Bounding the
-  // seek range keeps them near the fight, which is what actually removes the "flying
-  // everywhere" look; they now fade out where they were fired instead of crossing the map.
-  bulletSeekRange: 420,
   // ---- 瘦嘟嘟技能数值 ×1.3（按用户要求"全部技能数值提升到 1.3 倍"）----------------------
   // 下面这几个常量是她的金卡/红卡**写在派生公式里**的数值，不在卡面文字里直接出现，
   // 但同属"技能数值"，所以一并乘了 1.3。注释里保留原值，方便核对与回退：
@@ -426,7 +736,6 @@ const balance = {
   // 弹幕圈: every bullet-count upgrade thickens the ring, including after the projectile cap is
   // reached. Once the ring reaches radialRingFull bullets the arcs close into a solid circle.
   radialRingBonus: 0,
-  radialRingMax: 26,
   radialRingFull: 14,
   radialRingArcMin: 0.22,
   radialRingRadius: 26,
@@ -459,8 +768,17 @@ const balance = {
   // Until decided, treat 16,202 kills / Lv.138 as an UPPER BOUND reference - neither a bug to
   // rediscover nor a baseline to quote.
   rarityStatMultiplier: { gold: 1.1, red: 3.0 },
+  // 伤害乘区：乘法回来了，但系数下调（金 1.1、红 2.5 = 原 3.0 的 83%）。
+  // 只作用于伤害，不作用于生命（生命走 applyRarityFlatBonuses 的平坦 +20/+60）。
+  rarityDamageFactor: { gold: 1.12, red: 2.6 },
   comboWindow: 1.7,
   comboDamagePerStack: 0.02,
+  // 氛围粒子数量上限（纯视觉；同屏 1200 次绘制调用的预算里占 ~26 次）
+  ambientCap: 26,
+  // 时段分界（秒）：清晨 / 正午 / 黄昏 / 夜晚
+  timePhaseSeconds: [60, 120, 180],
+  // 时段切换的渐变时长（秒）：60/120/180 秒前后各 5 秒平滑过渡，避免天色突跳
+  timeTransitionSeconds: 5,
   comboDamageCap: 0.5,
   comboMovePerStack: 0.008,
   comboMoveCap: 0.2,
@@ -487,9 +805,17 @@ const balance = {
   pressureResponse: 0.35,
   surgeWarningLife: 2.4,
   resultRollTime: 1.1,
+  // ---- 经济出口 ----------------------------------------------------------------
+  // 金币的重复性出口：升级界面「重抽」。每次升级从 1 金币起，随后 2、4、8 翻倍，无次数上限；
+  // 每次升级重置回 1（不是整局重置）—— 让「这一级抽得烂」永远有救，但越想刷越贵。
+  // 经济分析与建议见 reports/经济设计-重抽曲线v2.md。
+  rerollBaseCost: 1,
+  // 防止 2^n 在极端次数下变成 Infinity（纯数学护栏，正常玩法到不了）
+  rerollCostCeiling: Number.MAX_SAFE_INTEGER,
+  // 种子的第二个出口：育苗（保底一株「还没有的」植物）。价格按稀有度；红隐藏植物不卖。
+  nurseryPrices: { blue: 60, purple: 240, gold: 900 },
   hitStopDuration: 0.03,
   hitStopCooldown: 0.6,
-  shakeDecay: 1,
 
   // ---- 奶大侠 (sword) ------------------------------------------------------------------
   // Deliberately slower than 瘦嘟嘟's 0.60 s gun: each swing is a heavier, wider, lingering
@@ -667,7 +993,6 @@ const balance = {
   // would cut real damage, because a splash does hit enemies (isSplash only stops re-splashing).
   waveVisualMinAlpha: 0.14,
   umbrellaThrowDelay: 0.35,
-  umbrellaMaxRange: 620,
   sanhuiCooldown: 12,
   umbrellaReturnRatio: 1.2,
   umbrellaBurstCount: 12,
@@ -682,11 +1007,11 @@ const balance = {
 };
 const bossSpawnTime = balance.bossSpawnTime;
 const skillRarity = {
-  white: { label: '白色', color: '#8a8d7b', weight: 38, points: 1, speedBonus: 2, weightBonus: 1 },
-  blue: { label: '蓝色', color: '#3498d5', weight: 30, points: 2, speedBonus: 3, weightBonus: 2 },
-  purple: { label: '紫色', color: '#9760c8', weight: 20, points: 3, speedBonus: 5, weightBonus: 3 },
-  gold: { label: '金色', color: '#c58a13', weight: 10, points: 5, speedBonus: 8, weightBonus: 4 },
-  red: { label: '红色', color: '#d84b52', weight: 2, points: 8, speedBonus: 12, weightBonus: 6 },
+  white: { label: '白色', color: '#8a8d7b', weight: 38, points: 1 },
+  blue: { label: '蓝色', color: '#3498d5', weight: 30, points: 2 },
+  purple: { label: '紫色', color: '#9760c8', weight: 20, points: 3 },
+  gold: { label: '金色', color: '#c58a13', weight: 10, points: 5 },
+  red: { label: '红色', color: '#d84b52', weight: 2, points: 8 },
 };
 const enemyBaseWeights = { basic: 3, runner: 3, stalker: 4, brute: 5, elite: 6, ape: 7, boss: 10 };
 const enemyStatCaps = { radius: 36, speed: 140 };
@@ -718,28 +1043,30 @@ function addCapped(key, amount, cap) {
 // once that stat is capped (see `addCapped`); those fallbacks are deliberately NOT part of the
 // ladder, so do not read them as rarity inversions.
 const upgrades = [
-  { title: '棍子数量 +1', description: '多一根棍子环绕攻击', rarity: 'purple', apply: () => { game.orbitStickCount += 1; } },
-  { title: '强力棍子', description: '基础攻击之外额外 +3', rarity: 'blue', apply: () => { game.bonusAttack += 3; } },
-  { title: '快速旋转', description: '环绕旋转速度提高；旋转已到上限时改为攻击力 +1', rarity: 'blue', apply: () => { if (!addCapped('orbitSpeed', 0.45, characterStatCaps.orbitSpeed)) game.bonusAttack += 1; } },
-  { title: '扩大轨道', description: '棍子环绕范围扩大；范围已到上限时改为旋转速度 +0.3', rarity: 'blue', apply: () => { if (!addCapped('orbitRadius', 12, characterStatCaps.orbitRadius)) game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed + 0.3); } },
+  { title: '棍子数量 +1', description: '多一根棍子环绕攻击；到达上限后改为攻击 +2', rarity: 'purple', offense: true, apply: () => { addSticks(1); } },
+  { title: '强力棍子', description: '基础攻击之外额外 +3', rarity: 'blue', offense: true, apply: () => { game.bonusAttack += 3; } },
+  { title: '快速旋转', description: '环绕旋转速度提高；旋转已到上限时改为攻击力 +1', rarity: 'blue', offense: true, apply: () => { if (!addCapped('orbitSpeed', 0.45, characterStatCaps.orbitSpeed)) game.bonusAttack += 1; } },
+  { title: '扩大轨道', description: '棍子环绕范围扩大；范围已到上限时改为旋转速度 +0.3', rarity: 'blue', offense: true, apply: () => { if (!addCapped('orbitRadius', 12, characterStatCaps.orbitRadius)) game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed + 0.3); } },
   { title: '轻便鞋子', description: '移动速度提高；已到上限时改为生命上限 +12', rarity: 'white', apply: () => { if (!addCapped('moveSpeed', 24, characterStatCaps.moveSpeed)) { game.maxHealth += 12; game.health += 12; } } },
-  { title: '奋勇强攻', description: '基础攻击力 +2', rarity: 'white', apply: () => { game.bonusAttack += 2; } },
+  { title: '奋勇强攻', description: '基础攻击力 +2', rarity: 'white', offense: true, apply: () => { game.bonusAttack += 2; } },
   { title: '急救包', description: '恢复生命并增加上限', rarity: 'white', apply: () => { game.maxHealth += 20; game.health = Math.min(game.maxHealth, game.health + 35); } },
   { title: '坚韧外衣', description: '每次碰撞少受 2 点伤害', rarity: 'white', apply: () => { game.damageReduction += 2; } },
-  { title: '长棍术', description: '环绕棍子的攻击距离增加；已到上限时改为攻击力 +1', rarity: 'blue', apply: () => { if (!addCapped('stickHitHalfLength', 10, characterStatCaps.stickLength)) game.bonusAttack += 1; } },
-  { title: '疾风步', description: '冲刺冷却缩短 0.8 秒；已到下限时改为冲刺伤害 +3', rarity: 'white', apply: () => { const next = Math.max(1.6, game.dashCooldownMax - 0.8); if (next < game.dashCooldownMax - 1e-9) { game.dashCooldownMax = next; } else { game.dashBonusDamage += 3; } } },
-  { title: '棍云冲撞', description: '冲刺伤害提高，棍子越多伤害越高', rarity: 'purple', apply: () => { game.dashBonusDamage += 3; } },
-  { title: '震劲棍法', description: '棍子攻击击退 +2', rarity: 'blue', apply: () => { game.knockback += 2; } },
-  { title: '裂地棍劲', description: '所有攻击击退 +4', rarity: 'purple', apply: () => { game.knockback += 4; } },
-  { title: '千钧扫荡', description: '所有攻击击退 +7，棍击范围 +8', rarity: 'gold', apply: () => { game.knockback += 7; game.stickHitHalfLength = Math.min(characterStatCaps.stickLength, game.stickHitHalfLength + 8); } },
-  { title: '棍势会心', description: '暴击率 +8%；暴击率已满时改为攻击力 +2', rarity: 'blue', apply: () => { if (!addCapped('critChance', 0.08, 0.75)) game.bonusAttack += 2; } },
-  { title: '破阵重击', description: '暴击率 +10%，暴击伤害倍率 +0.5', rarity: 'gold', apply: () => { game.critChance = Math.min(0.75, game.critChance + 0.10); game.critMultiplier += 0.5; } },
-  { title: '金棍阵', description: '环绕棍子数量 +2', rarity: 'gold', apply: () => { game.orbitStickCount += 2; } },
+  { title: '长棍术', description: '环绕棍子的攻击距离增加；已到上限时改为攻击力 +1', rarity: 'blue', offense: true, apply: () => { if (!addCapped('stickHitHalfLength', 10, characterStatCaps.stickLength)) game.bonusAttack += 1; } },
+  { title: '疾风步', description: '冲刺每格充能缩短 0.8 秒；已到下限时改为冲刺伤害 +3', rarity: 'white', apply: () => { const next = Math.max(1.6, game.dashRecharge - 0.8); if (next < game.dashRecharge - 1e-9) { game.dashRecharge = next; } else { game.dashBonusDamage += 3; } } },
+  { title: '棍云冲撞', description: '冲刺伤害 +3，命中后额外获得 1 层棍势', rarity: 'purple', offense: true, apply: () => { game.dashBonusDamage += 3; } },
+  { title: '震劲棍法', description: '棍击击退 +2，破甲持续 +0.8 秒', rarity: 'blue', apply: () => { game.knockback += 2; game.armorBreakLifeBonus += 0.8; } },
+  { title: '裂地棍劲', description: '棍击击退 +2，每次击退叠 1 层破甲（敌人受伤 +12%）', rarity: 'purple', offense: true, apply: () => { game.knockback += 2; game.armorBreakPerHit += 1; game.armorBreakLifeBonus += 0.5; } },
+  { title: '千钧扫荡', description: '棍击范围 +8，每次击退叠 2 层破甲', rarity: 'gold', offense: true, apply: () => { game.knockback += 3; game.stickHitHalfLength = Math.min(characterStatCaps.stickLength, game.stickHitHalfLength + 8); game.armorBreakPerHit += 1; } },
+  { title: '棍势会心', description: '暴击率 +8%；暴击率已满时改为攻击力 +2', rarity: 'blue', offense: true, apply: () => { if (!addCapped('critChance', 0.08, 0.75)) game.bonusAttack += 2; } },
+  { title: '破阵重击', description: '暴击率 +10%，暴击伤害倍率 +0.5', rarity: 'gold', offense: true, apply: () => { game.critChance = Math.min(0.75, game.critChance + 0.10); game.critMultiplier += 0.5; } },
+  { title: '金棍阵', description: '环绕棍子数量 +2；到达上限后改为攻击 +4', rarity: 'gold', offense: true, apply: () => { addSticks(2); } },
   { title: '金刚护体', description: '生命上限 +30，碰撞减伤 +3', rarity: 'blue', apply: () => { game.maxHealth += 30; game.health = Math.min(game.maxHealth, game.health + 30); game.damageReduction += 3; } },
   { title: '金钟震荡', description: '最大生命 +40，所有攻击击退 +6', rarity: 'gold', apply: () => { game.maxHealth += 40; game.health = Math.min(game.maxHealth, game.health + 40); game.knockback += 6; } },
-  { title: '破军扫棍', description: '攻击力 +7，棍击范围 +24', rarity: 'gold', apply: () => { game.bonusAttack += 7; game.stickHitHalfLength = Math.min(characterStatCaps.stickLength, game.stickHitHalfLength + 24); } },
-  { title: '黄金棍阵', description: '环绕棍子 +1，旋转速度 +0.7', rarity: 'gold', apply: () => { game.orbitStickCount += 1; game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed + 0.7); } },
-  { title: '赤霄雷暴棍', description: '雷电棍进化，棍子 +5，旋转速度 +70%，击退 +12', rarity: 'red', apply: () => { game.weaponEvolution = 'lightning'; game.orbitStickCount += 5; game.orbitSpeed *= 1.7; game.knockback += 12; } },
+  { title: '破军扫棍', description: '攻击力 +7，棍击范围 +24', rarity: 'gold', offense: true, apply: () => { game.bonusAttack += 7; game.stickHitHalfLength = Math.min(characterStatCaps.stickLength, game.stickHitHalfLength + 24); } },
+  { title: '黄金棍阵', description: '环绕棍子 +1（上限后转攻击），旋转速度 +0.7', rarity: 'gold', offense: true, apply: () => { addSticks(1); game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed + 0.7); } },
+  { title: '棍阵共鸣', description: '每 3 次棍击在附近触发一次冲击波（范围 40）', rarity: 'gold', offense: true, apply: () => { game.rodResonance = true; } },
+  { title: '回旋余劲', description: '冲刺后 2 秒内棍阵转速 +40%', rarity: 'purple', offense: true, apply: () => { game.dashSpinBonus = 0.4; } },
+  { title: '赤霄雷暴棍', description: '棍子 +3（上限后转攻击），雷暴伤害 +30%，击退叠 2 层破甲，冲刺充能上限 +1', rarity: 'red', offense: true, apply: () => { game.weaponEvolution = 'lightning'; addSticks(3); game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed * 1.7); game.lightningDamageMult = (game.lightningDamageMult || 1) * 1.3; game.armorBreakPerHit += 1; } },
 ];
 // ---- 瘦嘟嘟技能池（2025 按用户要求：全部技能数值 ×1.3）-----------------------------------
 // 规则与例外，写在这里以免下一个人以为是笔误：
@@ -758,10 +1085,10 @@ const upgrades = [
 const rabbitUpgrades = [
   { title: '高压弹头', description: '子弹伤害 +6.5', rarity: 'blue', apply: () => { game.bulletDamage += 6.5; } },
   { title: '快速装填', description: '射击间隔缩短 15.6%；已到射速上限时改为子弹伤害 +2.6', rarity: 'purple', apply: () => { const next = Math.max(characterStatCaps.fireInterval, game.fireInterval * 0.844); if (next < game.fireInterval - 1e-9) { game.fireInterval = next; } else { game.bulletDamage += 2.6; } } },
-  { title: '轮流装填', brief: '32.5% 概率额外发射 1 枚，最多叠 4 次', description: '每轮射击有 32.5% 概率额外发射 1 枚追踪子弹，最多叠 4 次；叠满后改为子弹伤害 +3.9', rarity: 'white', apply: () => { const next = Math.min(1, (game.alternateShotChance || 0) + 0.325); if (next > (game.alternateShotChance || 0) + 1e-9) { game.alternateShotChance = next; } else { game.bulletDamage += 3.9; } } },
-  { title: '双发点射', description: '每轮额外发射 2 枚追踪子弹；弹数已满时改为子弹伤害 +3.9、弹幕圈再补 2 发', rarity: 'purple', apply: () => { if (!addCapped('projectileCount', 2, 8)) { game.bulletDamage += 3.9; game.radialRingBonus += 2; } } },
+  { title: '轮流装填', brief: '32.5% 概率额外发射 1 枚，最多叠 4 次', description: '每轮射击有 32.5% 概率额外发射 1 枚子弹，最多叠 4 次；叠满后改为子弹伤害 +3.9', rarity: 'white', apply: () => { const next = Math.min(1, (game.alternateShotChance || 0) + 0.325); if (next > (game.alternateShotChance || 0) + 1e-9) { game.alternateShotChance = next; } else { game.bulletDamage += 3.9; } } },
+  { title: '双发点射', description: '每轮额外发射 2 枚子弹；弹数已满时改为子弹伤害 +3.9、弹幕圈再补 2 发', rarity: 'purple', apply: () => { if (!addCapped('projectileCount', 2, 8)) { game.bulletDamage += 3.9; game.radialRingBonus += 2; } } },
   { title: '穿透弹头', description: '每枚子弹可多命中 2 个敌人（红弹幕同样继承）', rarity: 'purple', apply: () => { game.projectilePierce += 2; } },
-  { title: '追踪芯片', description: '子弹飞行速度 +130、转向追踪 +1.56；速度已到上限时改为子弹伤害 +3.9', rarity: 'blue', apply: () => { const raised = addCapped('projectileSpeed', 130, gunCaps.projectileSpeed); game.projectileTurnRate += 1.56; if (!raised) game.bulletDamage += 3.9; } },
+  { title: '高速弹头', description: '子弹速度 +130、射程 +15%；速度已到上限时改为子弹伤害 +3.9', rarity: 'blue', apply: () => { const raised = addCapped('projectileSpeed', 130, gunCaps.projectileSpeed); game.bulletRangeBonus = Math.min(0.6, (game.bulletRangeBonus || 0) + 0.15); if (!raised) game.bulletDamage += 3.9; } },
   { title: '粽叶快投', description: '手雷冷却缩短 1.3 秒（最低 5 秒）；已到下限时改为手雷范围 +18.2', rarity: 'white', apply: () => { const next = Math.max(5, game.grenadeCooldownMax - 1.3); if (next < game.grenadeCooldownMax - 1e-9) { game.grenadeCooldownMax = next; } else { game.grenadeRadius = Math.min(characterStatCaps.grenadeRadius, game.grenadeRadius + 18.2); } } },
   { title: '扩散粽叶', description: '手雷爆炸范围 +41.6；已到上限时改为子弹伤害 +2.6', rarity: 'blue', apply: () => { if (!addCapped('grenadeRadius', 41.6, characterStatCaps.grenadeRadius)) game.bulletDamage += 2.6; } },
   { title: '爆芯糯米', brief: '手雷按生命百分比的伤害提升（有上限）', description: '普通怪手雷伤害 +6.5%（上限 45%），首领伤害 +2.6%（上限 15%）；双双封顶后改为子弹伤害 +3.9', rarity: 'purple', apply: () => { const before = game.grenadeDamageRatio + game.grenadeBossDamageRatio; game.grenadeDamageRatio = Math.min(0.45, game.grenadeDamageRatio + 0.065); game.grenadeBossDamageRatio = Math.min(0.15, game.grenadeBossDamageRatio + 0.026); if (Math.abs(game.grenadeDamageRatio + game.grenadeBossDamageRatio - before) < 1e-9) game.bulletDamage += 3.9; } },
@@ -947,6 +1274,7 @@ function applyPlantBonusChange(before, after) {
   else game.orbitSpeed = Math.min(characterStatCaps.orbitSpeed, game.orbitSpeed + orbitSpeedGain);
   game.dashCooldownMax = Math.max(1.6, game.dashCooldownMax - (after.dashCooldown - before.dashCooldown));
   game.dashCooldown = Math.min(game.dashCooldown, game.dashCooldownMax);
+  if (game.character === 'supreme') game.dashRecharge = Math.max(1.6, (game.dashRecharge || balance.dashRecharge) - (after.dashCooldown - before.dashCooldown));
 }
 
 function plantSetCount(setId, owned = profile.plants) {
@@ -997,8 +1325,14 @@ function finishGame(won) {
   profile.bestKills = Math.max(profile.bestKills, game.kills);
   for (const id of game.seenEnemies) if (!profile.enemySeen.includes(id)) profile.enemySeen.push(id);
   for (const id of Object.keys(game.enemyKills)) profile.enemyKills[id] = (profile.enemyKills[id] || 0) + game.enemyKills[id];
+  // 性能摘要：整局的平均 fps / 最差帧 / 实体峰值。只在采样足够时给，免得一局 5 秒就报出假数字。
+  game.perfRun = perf.runFrames >= 60 && perf.runMsSum > 0
+    ? { fps: Math.round((perf.runFrames * 1000) / perf.runMsSum), worst: Math.round(perf.frameMsMax), peak: perf.peakEntities }
+    : null;
   saveProfile();
+  clearAim();
   screen = 'result';
+  resumeLoop();   // 结算页要在静态屏（bossChoice）之后继续滚数字，循环必须重启
   playSound(won ? 'levelup' : 'hurt', 500);
 }
 
@@ -1045,8 +1379,10 @@ function getEnemyBuffStep(rarity) {
 
 function enemyBuffDescription(rarity) {
   const next = getEnemyBuffStep(rarity);
-  const healthPart = `血量 ×${next.healthMultiplier.toFixed(2)} +${next.health}`;
-  return `怪物强化：移速 +${next.speed}/秒 · 伤害 +${next.damage} · ${healthPart} · 重量 +${next.weight}`;
+  // 血量是连乘的倍率；界面不显示小数，所以改说「比开局多百分之几」——
+  // `×1.15` 里的小数点被藏掉会变成 `×1`，那是错的；`+15%` 才是准的。
+  const healthPart = `血量 +${fmtInt((next.healthMultiplier - 1) * 100)}% +${fmtInt(next.health)}`;
+  return `怪物强化：移速 +${fmtInt(next.speed)}/秒 · 伤害 +${fmtInt(next.damage)} · ${healthPart} · 重量 +${fmtInt(next.weight)}`;
 }
 
 // Monster health compounds, but the product is clamped: see enemyHealthMultiplierCap.
@@ -1082,7 +1418,12 @@ function applyEnemyBuff(rarity) {
   game.enemyBuffs.healthMultiplier = nextHealthProduct(game.enemyBuffs.healthMultiplier, buff.healthMultiplier || 1);
   game.enemyBuffs.health += buff.health || 0;
   game.enemyBuffs.weight += buff.weight;
-  for (const enemy of game.enemies) applyEnemyBuffToEnemy(enemy, rarity);
+  // 首领不参与中途强化：它的血量在 spawnBoss 时已按玩家 DPS 定好并被单次伤害上限约束，
+  // 再乘强化栈就会变成「打不完的墙」（实测 greedy 跑出 90 秒打不掉）。
+  for (const enemy of game.enemies) {
+    if (enemy.boss) continue;
+    applyEnemyBuffToEnemy(enemy, rarity);
+  }
   if (rarity === 'gold') {
     game.goldPicks += 1;
     triggerMonsterSurge(balance.surgeBurstPerGold, '金色');
@@ -1092,9 +1433,22 @@ function applyEnemyBuff(rarity) {
   }
 }
 
-function applyCurrentEnemyBuff(enemy) {
+function applyCurrentEnemyBuff(enemy, options) {
+  const skipHealth = !!(options && options.skipHealth);
   enemy.damage = enemy.damage || (enemy.boss ? 18 : 12);
   enemy.weight = enemy.weight === undefined ? (enemyBaseWeights[enemy.type] || 0) : enemy.weight;
+  // 首领血量单独按「玩家 DPS × 目标秒数」定（见 spawnBoss），不吃金/红累积的血量强化：
+  // 否则强 build 遇到更肉的首领、弱 build 反而好打，正好是「首领被一刀秒 / 永远打不完」两头。
+  if (skipHealth) {
+    for (const rarity of game.enemyBuffHistory) {
+      const buff = getEnemyBuffStep(rarity);
+      enemy.speed = Math.min(enemyStatCaps.speed, enemy.speed + buff.speed);
+      enemy.damage += buff.damage;
+      enemy.weight += buff.weight;
+    }
+    enemy.health = enemy.maxHealth;
+    return enemy;
+  }
   for (const rarity of game.enemyBuffHistory) applyEnemyBuffToEnemy(enemy, rarity);
   enemy.health = enemy.maxHealth;
   return enemy;
@@ -1105,13 +1459,24 @@ function applyCurrentEnemyBuff(enemy) {
 // as knockback does, so that ratio converged to ~0.476 and the whole stat silently stopped
 // working. The new curve never returns zero, so light enemies fly and heavy ones resist.
 // A pushed enemy that collides with another enemy deals slam damage to both.
+//
+// 2026-10-22 补两条（用户指出）：① 首领免疫击退；② 同一只怪连续被击退时抗性累积。
+// 没有 ② 时，棍阵每 0.22 秒刷一次 stagger，敌人永远处于「正在被击退」——既不前进也进不了
+// 接触范围，于是高棍数 = 物理免疫。现在抗性按每次击退 +step 累积、不挨打时按 decay 衰减，
+// 持续压制会「推得越来越推不动」，爆发式击退（手雷/冲刺）依旧一下把人掀出去。
 function knockbackEnemy(enemy, directionX, directionY) {
+  // 击退顺带上破甲：即使推不动（抗性满），易伤也在累积 —— 这是击退线的伤害出口
+  addArmorBreak(enemy, game.armorBreakPerHit || 1);
   const power = Math.max(0, game.knockback);
   if (!power) return;
+  if (enemy.boss) return;   // 首领必须真的走到你面前
   const weight = Math.max(1, enemy.weight || 1);
   const length = Math.sqrt(directionX * directionX + directionY * directionY);
   if (!length) return;
-  const strength = power / (power + weight);
+  const guard = Math.min(balance.knockbackGuardMax, enemy.knockbackGuard || 0);
+  const strength = (power / (power + weight)) * (1 - guard);
+  enemy.knockbackGuard = Math.min(balance.knockbackGuardMax, guard + balance.knockbackGuardStep);
+  if (strength < 0.02) return;   // 抗性满了就别再刷 stagger，让敌人自己走回来
   const maxDistance = balance.knockbackMaxDistance;
   const currentDistance = distanceBetween(enemy, game.player);
   if (currentDistance >= maxDistance) return;
@@ -1120,7 +1485,9 @@ function knockbackEnemy(enemy, directionX, directionY) {
   enemy.knockbackTargetY = game.player.y + directionY / length * distance;
   enemy.slamPower = strength;
   enemy.slamDone = false;
-  enemy.stagger = Math.max(enemy.stagger || 0, 0.16 + strength * 0.16);
+  // stagger 也要跟着抗性一起衰减，否则「每 0.22 秒重置 0.16 秒硬直」等于永久定身
+  const stagger = (0.16 + strength * 0.16) * (1 - guard);
+  enemy.stagger = Math.max(enemy.stagger || 0, stagger);
   // Trail points so the shove is visible as motion, not as a teleport between two frames.
   enemy.pushTrail = [{ x: enemy.x, y: enemy.y }];
 }
@@ -1156,7 +1523,18 @@ function applyAttackDamage(enemy, baseDamage, element = 'physical', allowCritica
   // 反哺（瘦嘟嘟金卡）是**独立乘区，算在所有加成的最后** —— 排在暴击与连杀倍率之后，
   // 所以它乘的是已经结算完的伤害，不会被任何其它加成重复放大。
   const feedScale = game.rabbitFeed ? 1 + game.rabbitFeedBonus : 1;
-  const damage = Math.max(1, Math.round(baseDamage * (critical ? game.critMultiplier : 1) * comboScale * feedScale));
+  const rarityScale = game.rarityDamageMultiplier || 1;
+  const armorScale = 1 + (enemy.armorBreak || 0) * balance.armorBreakDamage;
+  let damage = Math.max(1, Math.round(baseDamage * (critical ? game.critMultiplier : 1) * comboScale * feedScale * rarityScale * armorScale));
+  // 首领单次伤害上限：再高的爆发也只能打掉 maxHealth 的 bossHitCap，保证「至少 7 刀」。
+  // 没有这条时，高数值 build 会把首领和小怪一起秒掉，首领战退化成一次普通击杀。
+  if (enemy.boss && enemy.maxHealth > 0) {
+    const hitCap = Math.max(1, Math.round(enemy.maxHealth * balance.bossHitCap));
+    if (damage > hitCap) damage = hitCap;
+  }
+  // 近期 DPS 估计（首领血量按它定，见 spawnBoss）
+  game.damageThisSecond = (game.damageThisSecond || 0) + damage;
+  game.damageDealtTotal = (game.damageDealtTotal || 0) + damage;
   enemy.health -= damage;
   enemy.hitFlash = 0.16;
   // Exposed so bullet mechanics (穿甲) can react to whether this particular hit crit.
@@ -1379,7 +1757,11 @@ function gainExperience(value) {
   game.baseAttack += 1;
   game.knockback += 1;
   game.experienceNeeded = experienceNeededFor(game.level);
+  // 数值保底：每 5 级自动 +1 棍，保证即使一直抽防御卡，棍阵也在长
+  if (game.level % balance.stickPityEveryLevels === 0) addSticks(1);
   game.upgradeChoices = chooseUpgrades();
+  resetRerollForNewLevel();   // 每次升级，重抽价格回到 1 金币
+  if (game.coachStep < 2) game.coachStep = 2;
   screen = 'upgrade';
   playSound('levelup', 450);
   return true;
@@ -1451,6 +1833,39 @@ function fireRadialBarrage(player, damageScale, forcedCount) {
   return count;
 }
 
+// 直线弹道预判：敌人朝玩家走，所以用「位置 + 朝玩家速度 × 飞行时间」算提前量。
+// 只算一次（发射瞬间），飞行中不再修正 —— 这是直线弹道的代价。
+function predictEnemyPoint(enemy, bulletSpeed) {
+  const dx = game.player.x - enemy.x;
+  const dy = game.player.y - enemy.y;
+  const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+  const moving = (enemy.stun || 0) <= 0 && (enemy.stagger || 0) <= 0 && !enemy.dying;
+  const closing = moving ? (enemy.speed || 0) : 0;
+  // 敌人朝玩家走：用「弹速 + 接近速度」求拦截时间，否则提前量会越过敌人
+  const flight = Math.min(0.6, distance / Math.max(1, bulletSpeed + closing));
+  const vx = moving ? (dx / distance) * closing : 0;
+  const vy = moving ? (dy / distance) * closing : 0;
+  return { x: enemy.x + vx * flight, y: enemy.y + vy * flight };
+}
+
+// 连锁弹：命中后向附近另一个敌人放电（子弹本身消失）
+function chainZapFrom(source, damage, radius = 120) {
+  let best = null;
+  let bestDistance = Infinity;
+  for (const enemy of game.enemies) {
+    if (enemy === source || enemy.health <= 0 || !isEnemyVisible(enemy)) continue;
+    const distance = distanceBetween(enemy, source);
+    if (distance > radius || distance >= bestDistance) continue;
+    best = enemy;
+    bestDistance = distance;
+  }
+  if (!best) return;
+  applyAttackDamage(best, Math.max(1, damage), 'lightning');
+  game.lightningBolts = game.lightningBolts || [];
+  game.lightningBolts.push({ fromX: source.x, fromY: source.y, toX: best.x, toY: best.y, life: 0.12, maxLife: 0.12 });
+  burstParticles(best.x, best.y, UI.dashCyan, 6);
+}
+
 // 冲击爆破 (重炮弹头): shared by normal and radial bullets so the mechanic reads as one thing.
 function bulletImpactBlast(x, y, damage, source) {
   if (!game.bulletBlast) return;
@@ -1464,27 +1879,6 @@ function bulletImpactBlast(x, y, damage, source) {
   game.shockwaves.push({ x, y, radius: balance.bulletBlastRadius, life: 0.22, maxLife: 0.22 });
 }
 
-// Pick the best target this bullet is allowed to have. Enemies already claimed by another
-// bullet in the same pass are skipped unless there is nothing else to shoot at, so a volley
-// spreads over the horde instead of stacking on one enemy.
-function chooseBulletTarget(bullet, claimed) {
-  let best = null;
-  let fallback = null;
-  const consider = (current, enemy, distance) => (!current
-    || enemy.health < current.enemy.health
-    || (enemy.health === current.enemy.health && distance < current.distance))
-    ? { enemy, distance } : current;
-  for (const enemy of game.enemies) {
-    if (!isEnemyVisible(enemy) || bullet.hitEnemies.includes(enemy)) continue;
-    const distance = distanceBetween(enemy, bullet);
-    if (distance >= balance.bulletSeekRange) continue;
-    fallback = consider(fallback, enemy, distance);
-    if (claimed.has(enemy)) continue;
-    best = consider(best, enemy, distance);
-  }
-  return (best || fallback) ? (best || fallback).enemy : null;
-}
-
 function throwGrenade() {
   if (game.character !== 'rabbit' || game.grenadeCooldown > 0) return false;
   const target = game.enemies.reduce((best, enemy) => {
@@ -1496,13 +1890,104 @@ function throwGrenade() {
       ? { enemy, ratio, distance } : best;
   }, null);
   if (!target) return false;
+  return throwGrenadeAt(target.enemy.x, target.enemy.y);
+}
+
+// 屏幕坐标 → 世界坐标（worldToScreen 的逆运算）
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - width / 2) / gameWorldZoom + width / 2 + game.camera.x,
+    y: (sy - height / 2) / gameWorldZoom + height / 2 + game.camera.y,
+  };
+}
+
+// 手雷拖动向量（方向 + 长度）
+function grenadeDragVector() {
+  const button = skillButtonBounds();
+  const dx = (game.aimRawX || 0) - button.x;
+  const dy = (game.aimRawY || 0) - button.y;
+  const length = Math.sqrt(dx * dx + dy * dy);
+  return {
+    dx, dy, length,
+    dirX: length > 1e-6 ? dx / length : game.facing,
+    dirY: length > 1e-6 ? dy / length : 0,
+  };
+}
+
+// 拖到最大射程所需的手指行程（用于超距取消阈值）
+function grenadeDragNeed() {
+  return balance.grenadeThrowRange / balance.grenadeDragGain;
+}
+
+// 未锁定时的落点：方向 × clamp(拖动×1.2, 90, 420)，再夹到世界边界与屏幕安全区
+function grenadeAimPointer() {
+  const drag = grenadeDragVector();
+  // 距离按屏幕像素算，再夹到屏幕安全区：玩家居中，最远落点必然在屏幕边缘（420 只是上限）
+  const distance = Math.min(balance.grenadeThrowRange, Math.max(balance.grenadeThrowMin, drag.length * balance.grenadeDragGain));
+  const playerScreen = worldToScreen(game.player.x, game.player.y);
+  const margin = 40;
+  const screenX = Math.max(margin, Math.min(width - margin, playerScreen.x + drag.dirX * distance));
+  const screenY = Math.max(viewInsets.top + 90, Math.min(height - viewInsets.bottom - 60, playerScreen.y + drag.dirY * distance));
+  const world = screenToWorld(screenX, screenY);
+  return {
+    x: Math.max(40, Math.min(game.worldWidth - 40, world.x)),
+    y: Math.max(72 + 40, Math.min(game.worldHeight - 40, world.y)),
+  };
+}
+
+// 最终落点：锁定目标优先
+function grenadeLandingPoint() {
+  const target = game.grenadeAimTarget && game.grenadeAimTarget.health > 0 ? game.grenadeAimTarget : null;
+  if (target) return { x: target.x, y: target.y, locked: true };
+  const point = grenadeAimPointer();
+  return { x: point.x, y: point.y, locked: false };
+}
+
+// 落点圈 28px 内吸附敌人；40px 滞回；超距状态同步计算
+function updateGrenadeAimTarget() {
+  const drag = grenadeDragVector();
+  game.grenadeAimOverdrag = drag.length > grenadeDragNeed() * balance.grenadeOverdragRatio;
+  const pointerWorld = grenadeAimPointer();
+  const pointer = worldToScreen(pointerWorld.x, pointerWorld.y);
+  const current = game.grenadeAimTarget;
+  if (current && current.health > 0) {
+    const center = enemyVisualCenter(current);
+    if (Math.sqrt((center.x - pointer.x) ** 2 + (center.y - pointer.y) ** 2) <= balance.grenadeLockKeepRadius) return;
+  }
+  game.grenadeAimTarget = null;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const enemy of game.enemies) {
+    if (enemy.health <= 0 || !isEnemyVisible(enemy)) continue;
+    const center = enemyVisualCenter(enemy);
+    const distance = Math.sqrt((center.x - pointer.x) ** 2 + (center.y - pointer.y) ** 2);
+    if (distance <= balance.grenadeLockRadius && distance < bestDistance) { best = enemy; bestDistance = distance; }
+  }
+  game.grenadeAimTarget = best;
+}
+
+// 投掷到指定世界坐标：距离决定飞行时长与弧高
+function throwGrenadeAt(x, y) {
+  if (game.character !== 'rabbit' || game.grenadeCooldown > 0) return false;
+  const distance = Math.hypot(x - game.player.x, y - game.player.y);
   game.grenades.push({
     fromX: game.player.x, fromY: game.player.y,
-    x: target.enemy.x, y: target.enemy.y,
-    elapsed: 0, duration: game.grenadeFlightDuration,
+    x, y,
+    elapsed: 0,
+    duration: 0.35 + distance / 1200,
+    arcHeight: 70 + distance * 0.16,
   });
   game.grenadeCooldown = game.grenadeCooldownMax;
   return true;
+}
+
+// 松手：超距取消 / 回拖取消 / 投掷到落点
+function releaseGrenadeAim() {
+  const drag = grenadeDragVector();
+  if (game.grenadeAimOverdrag || drag.length <= balance.aimCancelRadius) { clearAim(); return; }
+  const landing = grenadeLandingPoint();
+  clearAim();
+  throwGrenadeAt(landing.x, landing.y);
 }
 
 function updateGrenades(delta) {
@@ -2385,6 +2870,25 @@ function updateThornCharge(delta) {
   game.plantNotice = { text: '反刺爆发！', life: 1.4 };
 }
 
+// 死因复盘：把「被哪个怪打死」翻译成一句玩家能用的建议。
+// 只认伤害来源的类型（敌人接触伤害是唯一来源），不猜更多 —— 这一栏要能被无头仿真读到。
+function describeDeath(lastHit) {
+  const type = lastHit && lastHit.type ? lastHit.type : 'basic';
+  const entry = enemyCatalog.find((enemy) => enemy.id === type);
+  const adviceTable = {
+    boss: '别贴脸：首领冲撞有前摇，看到抬手就往侧面走',
+    stalker: '夜行客贴得快：别往墙角跑，往空地绕圈',
+    brute: '壮壮怪伤害高：先用闪避拉开，再在它转身时绕后',
+    runner: '疾跑怪血少但粘人：优先打掉，别让它一直贴在身上',
+    elite: '精英怪硬：别硬顶，绕着它打输出',
+    ape: '丛林猿冲撞范围大：贴身时先闪避',
+  };
+  return {
+    name: entry ? entry.name : '捣蛋虫',
+    advice: adviceTable[type] || '别让怪堆裹住：移动着打，血少时往空地撤',
+    damage: lastHit ? Math.round(lastHit.damage) : 0,
+  };
+}
 function damagePlayer(amount, source) {
   let damage = Math.max(1, amount - game.damageReduction);
   const robe = thornRobePower();
@@ -2399,13 +2903,25 @@ function damagePlayer(amount, source) {
     }
   }
   game.health -= damage;
+  game.lastHit = source ? { type: source.type || 'basic', boss: !!source.boss, damage } : { type: 'unknown', boss: false, damage };
   return damage;
 }
 
-function scaleCharacterStats(factor) {
-  const multiply = ['maxHealth', 'health', 'baseAttack', 'bonusAttack', 'bulletDamage', 'projectileSpeed', 'projectileTurnRate', 'critMultiplier', 'knockback', 'dashBonusDamage', 'swordDamage', 'umbrellaDamage'];
+function scaleCharacterStats(factor, rarity) {
+  // 只放大「输出」类属性。生存属性（maxHealth / health）**故意不在列表里**：
+  // 红技能 factor=3，乘上去等于「回满 + 三倍血」，实测把同角色末血量从 418~648 拉到 1324~1773
+  // （12 局 balanced 仿真，见 reports/节奏诊断-第1轮.md §六）—— 抽到红就不再会死，
+  // 难度曲线随之消失。生存改为平坦加血（applyRarityFlatBonuses 里 gold +20 / red +60）。
+  // 只放大「手感/位移」类属性（弹速、转向、击退）；伤害走下面的单一乘区，生命走 applyRarityFlatBonuses。
+  // 原因：伤害属性是乘法时，18 金 + 2 红 = 1.1^18 × 3^2 ≈ 50 倍，实测 160 秒总伤害 1.3 亿、
+  // 平均 81 万/秒，小怪血量只有几百 —— 后期必然「扫过就死」，首领也只能靠公式硬接。
+  // 改成加法后同样的 build 是 1 + 0.1×18 + 2×2 = 6.8 倍：数字照样在涨（爽感保留），但不再失控。
+  const multiply = ['projectileSpeed', 'projectileTurnRate', 'knockback'];
   multiply.forEach((key) => { if (typeof game[key] === 'number') game[key] *= factor; });
   ['projectileCount', 'projectilePierce', 'orbitStickCount'].forEach((key) => { if (typeof game[key] === 'number') game[key] = Math.ceil(game[key] * factor); });
+  // 伤害走单一乘区：金 ×1.1 / 红 ×2.5（系数在 balance.rarityDamageFactor，比原来的 ×3 低）。
+  const damageFactor = (balance.rarityDamageFactor || {})[rarity];
+  if (damageFactor) game.rarityDamageMultiplier = (game.rarityDamageMultiplier || 1) * damageFactor;
   game.critChance = Math.min(1, game.critChance * factor);
   // NOTE: damageReduction is deliberately NOT scaled here. It is a *flat subtractive* stat
   // (damagePlayer does `Math.max(1, amount - damageReduction)`), every skill that grants it does
@@ -2415,12 +2931,18 @@ function scaleCharacterStats(factor) {
   // not. (Removing this line is the whole fix - see D1 04/patches P1.)
   game.dashCooldownMax = Math.max(0.05, game.dashCooldownMax / factor);
   game.dashCooldown = Math.max(0, game.dashCooldown / factor);
+  if (game.character === 'supreme') game.dashRecharge = Math.max(1.6, (game.dashRecharge || balance.dashRecharge) / factor);
   game.characterPowerMultiplier *= factor;
 }
 
 function applyRarityFlatBonuses(rarity) {
   const gold = rarity === 'gold';
   const amount = gold ? 1 : 2;
+  // 生存属性改成平坦成长（原来是乘进 scaleCharacterStats，红一次 ×3）：
+  // 金 +20、红 +60，同时按同额回血 —— 有「吃到好东西变结实」的手感，但不会一局封顶。
+  const healthGain = gold ? 20 : 60;
+  game.maxHealth += healthGain;
+  game.health = Math.min(game.maxHealth, game.health + healthGain);
   game.moveSpeed = Math.min(characterStatCaps.moveSpeed, game.moveSpeed + amount * 10);
   if (game.character === 'rabbit') {
     game.attackRange = Math.min(characterStatCaps.attackRange, game.attackRange + amount * 40);
@@ -2509,6 +3031,43 @@ xiaoxianSprite.src = 'assets/xiaoxian-fairy.png';
 umbrellaSprite.onload = () => { umbrellaReady = true; draw(); };
 umbrellaSprite.src = 'assets/xiaoxian-umbrella.png';
 
+uiPanelSprite.onload = () => { uiPanelReady = true; draw(); };
+uiPanelSprite.src = 'assets/ui-panel9.png';
+
+uiGrainSprite.onload = () => { uiGrainReady = true; draw(); };
+uiGrainSprite.src = 'assets/ui-grain.png';
+
+uiWashSprite.onload = () => { uiWashReady = true; draw(); };
+uiWashSprite.src = 'assets/ui-wash.png';
+
+uiVignetteSprite.onload = () => { uiVignetteReady = true; draw(); };
+uiVignetteSprite.src = 'assets/ui-vignette.png';
+
+fxGlowSprite.onload = () => { fxGlowReady = true; draw(); };
+fxGlowSprite.src = 'assets/fx-glow.png';
+ambientSprites.petal.onload = () => { ambientReady.petal = true; draw(); };
+ambientSprites.petal.src = 'assets/fx-petal.png';
+ambientSprites.leaf.onload = () => { ambientReady.leaf = true; draw(); };
+ambientSprites.leaf.src = 'assets/fx-leaf.png';
+ambientSprites.firefly.onload = () => { ambientReady.firefly = true; draw(); };
+ambientSprites.firefly.src = 'assets/fx-firefly.png';
+ambientSprites.dust.onload = () => { ambientReady.dust = true; draw(); };
+ambientSprites.dust.src = 'assets/fx-dust.png';
+groundSprite.onload = () => { groundReady = true; draw(); };
+groundSprite.src = 'assets/bg-ground.jpg';
+menuKeyartSprite.onload = () => { menuKeyartReady = true; draw(); };
+menuKeyartSprite.src = 'assets/menu-keyart.jpg';
+groundDetailSprite.onload = () => { groundDetailReady = true; draw(); };
+groundDetailSprite.src = 'assets/bg-ground-detail.png';
+decorSprites.flowers.onload = () => { decorReady.flowers = true; draw(); };
+decorSprites.flowers.src = 'assets/decor-flowers.png';
+decorSprites.stones.onload = () => { decorReady.stones = true; draw(); };
+decorSprites.stones.src = 'assets/decor-stones.png';
+decorSprites.fence.onload = () => { decorReady.fence = true; draw(); };
+decorSprites.fence.src = 'assets/decor-fence.png';
+decorSprites.puddle.onload = () => { decorReady.puddle = true; draw(); };
+decorSprites.puddle.src = 'assets/decor-puddle.png';
+
 // The two new heroes are handled by a sprite without a 180-degree baked-in body, so they use
 // the same horizontal-mirroring helper as everyone else.
 function getCharacterSprite(id) {
@@ -2562,21 +3121,59 @@ function drawFacingSprite(sprite, x, y, spriteWidth, spriteHeight, facing, alpha
   context.restore();
 }
 
+// 安全区。刘海/状态栏/Home 指示条的高度必须让出来，否则顶部 HUD 会压在状态栏底下。
+// screenHeight 是含状态栏的全屏高度；safeArea 是真正可交互的矩形。
+// wx.getWindowInfo() 是官方推荐的新接口，老基础库上回落到 getSystemInfoSync()。
+let viewInsets = { top: 0, bottom: 0 };
+
+// 顶部面板与屏幕顶端之间额外留的空白（用户要求「顶部面板下移」）。
+// 它和安全区是叠加关系：无刘海机型 = 20px，有刘海 = safeArea.top + 20。
+// 暂停键、波次提示、小地图都跟着这个值走，否则面板下移后会互相压住。
+const HUD_TOP_GAP = 20;
+
+function resolveInsets() {
+  const info = (wx.getWindowInfo ? wx.getWindowInfo() : wx.getSystemInfoSync()) || {};
+  const fallback = wx.getSystemInfoSync ? wx.getSystemInfoSync() : {};
+  const safe = info.safeArea || fallback.safeArea;
+  const screenHeight = info.screenHeight || fallback.screenHeight || 0;
+  const top = safe && Number.isFinite(safe.top) ? safe.top : (info.statusBarHeight || fallback.statusBarHeight || 0);
+  const bottom = safe && Number.isFinite(safe.bottom) ? Math.max(0, screenHeight - safe.bottom) : 0;
+  return { top: Math.max(0, top || 0), bottom: Math.max(0, bottom || 0) };
+}
+
 function resize() {
   const info = wx.getSystemInfoSync();
   width = info.screenWidth;
   height = info.screenHeight;
   pixelRatio = info.pixelRatio || 1;
+  viewInsets = resolveInsets();
   canvas.width = Math.round(width * pixelRatio);
   canvas.height = Math.round(height * pixelRatio);
   context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   draw();
 }
 
-function roundedRect(x, y, rectWidth, rectHeight, radius) {
+// 圆角路径用 arcTo 手写，不再依赖 context.roundRect。
+// 原先的 `if (context.roundRect) ... else context.rect(...)` 在老基础库上会把 43 处调用
+// 静默降级成直角 —— 版面能跑、观感全塌，而且没有任何报错。手写路径没有版本依赖。
+// 拆成「路径」+「填充」两步，是因为 clip() 也要用同一条路径（纸纹只该盖在面板里）。
+function roundRectPath(x, y, rectWidth, rectHeight, radius) {
+  const r = Math.max(0, Math.min(radius, rectWidth / 2, rectHeight / 2));
   context.beginPath();
-  if (context.roundRect) context.roundRect(x, y, rectWidth, rectHeight, radius);
-  else context.rect(x, y, rectWidth, rectHeight);
+  if (r < 0.5) {
+    context.rect(x, y, rectWidth, rectHeight);
+    return;
+  }
+  context.moveTo(x + r, y);
+  context.arcTo(x + rectWidth, y, x + rectWidth, y + rectHeight, r);
+  context.arcTo(x + rectWidth, y + rectHeight, x, y + rectHeight, r);
+  context.arcTo(x, y + rectHeight, x, y, r);
+  context.arcTo(x, y, x + rectWidth, y, r);
+  context.closePath();
+}
+
+function roundedRect(x, y, rectWidth, rectHeight, radius) {
+  roundRectPath(x, y, rectWidth, rectHeight, radius);
   context.fill();
 }
 
@@ -2588,52 +3185,609 @@ function insideRect(rect, touch) {
     && touch.clientY >= rect.y && touch.clientY <= rect.y + rect.height;
 }
 
+// 主菜单布局：所有 UI 收进上方 30%（key art 的天空区），下 70% 留给「点角色」。
+// 小屏（高度 < 620 或宽度 < 340）用抽屉收纳：顶栏只留标题 + 抽屉按钮。
+function menuCompact() { return height < 620 || width < 340; }
+
 function menuLayout() {
-  const buttonWidth = Math.min(240, width - 48);
-  // Clamp so the stack still fits: the last button ends at buttonY + 222 + 38, so at 0.57h the
-  // bottom edge (0.57h + 260) runs past the screen once h < ~605 - on a 568pt screen it hung
-  // 15.8px off the bottom while the touch rect stayed complete, i.e. visible-cut but clickable.
-  const buttonY = Math.min(height * 0.57, height - 272);
   return {
-    start: { x: (width - buttonWidth) / 2, y: buttonY, width: buttonWidth, height: 60 },
-    wardrobe: { x: width / 2 - 90, y: buttonY + 76, width: 180, height: 42 },
-    garden: { x: width / 2 - 90, y: buttonY + 126, width: 180, height: 42 },
-    enemyCodex: { x: width / 2 - 90, y: buttonY + 176, width: 180, height: 38 },
-    skillCodex: { x: width / 2 - 90, y: buttonY + 222, width: 180, height: 38 },
+    drawerButton: { x: width - 48, y: viewInsets.top + 8, width: 40, height: 40 },
   };
 }
 
-function characterCardBounds(index) {
-  // Four characters now, so the row of two became a 2x2 grid.
-  const cardWidth = (width - 52) / 2;
+// 侧边栏：4 个入口的图标条。收起时只有图标（44×44），展开时图标 + 完整名称（抽屉式）。
+function menuSidebarItems() {
+  return [
+    { id: 'wardrobe', glyph: 'wardrobe', label: '装扮小院队员', screen: 'wardrobe' },
+    { id: 'garden', glyph: 'garden', label: '打理小院', screen: 'garden' },
+    { id: 'enemy', glyph: 'enemy', label: '敌人图鉴', screen: 'enemyCodex' },
+    { id: 'skill', glyph: 'skill', label: '技能图鉴', screen: 'skillCodex' },
+  ];
+}
+
+function menuSidebarBounds() {
+  const parts = menuSidebarItems();
+  // 整体比上一版缩 20%：52→42 宽、44→36 图标；触控高度仍保 44（不小于最小触控目标）
+  const railWidth = 42;
+  const iconSize = 36;
+  const itemGap = 6;
+  const itemHeight = 44;
+  const labelWidth = 94;
+  // 起点挪到「战绩」那行下面（标题 0.085h + 副标题 + 战绩 ≈ +44），不再从 0.175h 起
+  const titleY = menuCompact() ? viewInsets.top + 34 : height * 0.085;
+  const top = titleY + 44 + 18;
+  const panelTop = top - 8;
+  const panelBottom = top + parts.length * (itemHeight + itemGap) - itemGap + 8;
+  const panelLeft = 0;
+  return { railWidth, iconSize, labelWidth, itemHeight, itemGap, top, panelTop, panelBottom, panelLeft, panelWidth: labelWidth + railWidth + 8 };
+}
+// 侧边栏一行：展开时整行（文字 + 图标）都可点，收起时只有图标
+function menuSidebarRowBounds(index) {
+  const bar = menuSidebarBounds();
+  const item = menuSidebarItemBounds(index);
+  if (!menuSidebarExpanded) return item;
+  return { x: 0, y: item.y, width: bar.panelWidth, height: item.height };
+}
+
+function menuSidebarItemBounds(index) {
+  const bar = menuSidebarBounds();
   return {
-    x: 18 + (index % 2) * (cardWidth + 16),
-    y: height * 0.325 + Math.floor(index / 2) * 68,
-    width: cardWidth,
-    height: 62,
+    x: 0,
+    y: bar.top + index * (bar.itemHeight + bar.itemGap),
+    width: bar.railWidth,
+    height: bar.itemHeight,
   };
 }
 
+// 图标方块（比触摸矩形略小，留出内边距）
+function menuSidebarIconRect(index) {
+  const bar = menuSidebarBounds();
+  const touch = menuSidebarItemBounds(index);
+  const inset = (touch.width - bar.iconSize) / 2;
+  return { x: touch.x + inset, y: touch.y + (touch.height - bar.iconSize) / 2, width: bar.iconSize, height: bar.iconSize };
+}
+
+// 点角色选择：四个角色的归一化命中圈（17-角色点击热区.png 校准过）
+// cx/cy 相对 key art 宽高，r 相对宽度；priority 越小越靠前（重叠时先命中）。
+function menuHitCircles() {
+  return [
+    { id: 'supreme', cx: 0.470, cy: 0.750, r: 0.110, priority: 0, accent: UI.aimLabel },
+    { id: 'rabbit', cx: 0.350, cy: 0.600, r: 0.085, priority: 3, accent: '#ff8a4c' },
+    { id: 'daxia', cx: 0.575, cy: 0.605, r: 0.078, priority: 1, accent: '#5ec8e5' },
+    { id: 'xiaoxian', cx: 0.700, cy: 0.690, r: 0.070, priority: 2, accent: '#f78fb3' },
+  ];
+}
+
+// key art 以 cover 铺满时：归一化 → 屏幕坐标
+function menuArtPlacement() {
+  const art = menuKeyartReady ? menuKeyartSprite : background;
+  const artWidth = (art && art.width) || 636;
+  const artHeight = (art && art.height) || 904;
+  const scale = Math.max(width / artWidth, height / artHeight);
+  return {
+    artWidth, artHeight, scale,
+    offsetX: (width - artWidth * scale) / 2,
+    offsetY: (height - artHeight * scale) / 2,
+  };
+}
+
+function menuHitScreen(circle) {
+  const place = menuArtPlacement();
+  return {
+    x: place.offsetX + circle.cx * place.artWidth * place.scale,
+    y: place.offsetY + circle.cy * place.artHeight * place.scale,
+    r: circle.r * place.artWidth * place.scale,
+  };
+}
+
+// 命中测试：按优先级（前→后）取第一个命中的角色
+function menuPickAt(x, y) {
+  const circles = menuHitCircles().slice().sort((a, b) => a.priority - b.priority);
+  for (const circle of circles) {
+    const box = menuHitScreen(circle);
+    const dx = x - box.x;
+    const dy = y - box.y;
+    if (dx * dx + dy * dy <= box.r * box.r) return circle.id;
+  }
+  return null;
+}
+
+function menuCharacter(id) { return characters.find((character) => character.id === id) || characters[0]; }
+
+// 机制卡：文案不带数值，避免和真实数值不同步（A7.1 也不允许小数）
+// 主动技能一句话说明（技能图鉴与测试共用；至尊奶的「免疫接触伤害」必须写出来）
+const characterActiveSkills = {
+    supreme: '主动：棍影冲刺（长按可 0.1x 瞄准；充能 2 格（红卡与 6 根棍各 +1 上限）· 期间免疫接触伤害 · 伤害随棍阵成长）',
+  rabbit: '主动：粽子手雷（长按可 0.1x 瞄准，拖动选落点；抛物线预览 · 按生命百分比范围伤害 + 眩晕）',
+  daxia: '主动：无极闪（全屏刀光，冷却由属性决定）',
+  xiaoxian: '主动：伞回（多把伞同时回旋，冷却由属性决定）',
+};
+
+const characterMechanics = {
+  supreme: ['武器：随身棍阵', '按住移动，棍阵自动绕身', '靠近就转，越密越疼'],
+  rabbit: ['武器：粽子轰炸', '定时抛掷，落地范围伤害', '人越挤越爽'],
+  daxia: ['武器：刀光突进', '冲刺斩击，穿过敌群', '暴击率高，生命偏低'],
+  xiaoxian: ['武器：伞面轻舞', '自动回血，减速周围', '守得住，伤害慢热'],
+};
+
+// 传送门（key art 右上巨型光圈）：命中圈按 22-传送门热区校准.png 校准
+function menuPortalCircle() {
+  return { cx: 0.710, cy: 0.420, r: 0.190 };
+}
+
+function menuPortalScreen() {
+  const place = menuArtPlacement();
+  const circle = menuPortalCircle();
+  return {
+    x: place.offsetX + circle.cx * place.artWidth * place.scale,
+    y: place.offsetY + circle.cy * place.artHeight * place.scale,
+    r: circle.r * place.artWidth * place.scale,
+  };
+}
+
+function menuPortalHit(x, y) {
+  const box = menuPortalScreen();
+  const dx = x - box.x;
+  const dy = y - box.y;
+  return dx * dx + dy * dy <= box.r * box.r;
+}
+
+// 传送门过场：总时长 2 秒。前 0.9 秒还在主界面（只留主背景，UI 全撤），
+// 0.9–1.5 秒白光从门心铺满，1.5 秒全白那一帧才真正切到战斗，1.5–2 秒白光褪出战斗。
+const portalUIFadeMs = 180;       // UI 淡出（这之后屏幕只剩主背景）
+const portalChargeMs = 720;       // 蓄力：光圈收紧、亮度上去
+const portalBurstMs = 600;        // 白光从门心铺满屏幕
+const portalHoldMs = 60;          // 全白保持（切战斗就在这一帧）
+const portalFadeMs = 440;         // 白光褪出战斗
+const portalSwitchMs = portalUIFadeMs + portalChargeMs + portalBurstMs; // 1500ms
+const portalFlashTotal = portalSwitchMs + portalHoldMs + portalFadeMs;  // 2000ms
+
+function portalUIFadeAlpha(ms) {
+  if (ms >= portalUIFadeMs) return 0;
+  return Math.max(0, 1 - ms / portalUIFadeMs);
+}
+
+function portalBurstProgress(ms) {
+  if (ms <= portalUIFadeMs + portalChargeMs) return 0;
+  if (ms >= portalSwitchMs) return 1;
+  return (ms - portalUIFadeMs - portalChargeMs) / portalBurstMs;
+}
+
+function portalChargeIntensity(ms) {
+  if (ms <= portalUIFadeMs) return 0;
+  if (ms >= portalUIFadeMs + portalChargeMs) return 1;
+  return (ms - portalUIFadeMs) / portalChargeMs;
+}
+
+function portalFlashRadius(ms, portalRadius) {
+  const progress = portalBurstProgress(ms);
+  if (progress <= 0) return 0;
+  // 前 30% 慢、后面加速铺满
+  const eased = progress * progress * (3 - 2 * progress) * 0.55 + progress * 0.45;
+  return portalRadius + eased * Math.hypot(width, height) * 1.4;
+}
+
+function portalFlashAlpha(ms) {
+  if (ms <= 0 || ms >= portalFlashTotal) return 0;
+  const progress = portalBurstProgress(ms);
+  if (progress <= 0) return 0;
+  if (progress < 1) return Math.min(1, 0.15 + progress * 1.1);
+  if (ms < portalSwitchMs + portalHoldMs) return 1;
+  const t = (ms - portalSwitchMs - portalHoldMs) / portalFadeMs;
+  return Math.max(0, 1 - t);
+}
+
+function drawPortalFlash() {
+  if (portalTransitionAt < 0) return;
+  const elapsed = Date.now() - portalTransitionAt;
+  if (elapsed >= portalFlashTotal) { portalTransitionAt = -1; return; }
+  const alpha = portalFlashAlpha(elapsed);
+  if (alpha <= 0) return;
+  const portal = menuPortalScreen();
+  context.save();
+  // 白光从门心铺满（径向渐变），铺满后整屏纯白
+  const radius = Math.min(portalFlashRadius(elapsed, portal.r), Math.hypot(width, height) * 1.6);
+  if (radius < Math.hypot(width, height) * 1.5) {
+    const burst = context.createRadialGradient(portal.x, portal.y, portal.r * 0.3, portal.x, portal.y, radius);
+    burst.addColorStop(0, UI.burstCore);
+    burst.addColorStop(0.72, UI.burstMid);
+    burst.addColorStop(1, UI.burstEdge);
+    context.globalAlpha = Math.min(1, alpha * 1.15);
+    context.fillStyle = burst;
+    context.fillRect(0, 0, width, height);
+  }
+  if (radius >= Math.hypot(width, height) * 1.2 || alpha >= 0.8) {
+    context.globalAlpha = alpha;
+    context.fillStyle = UI.cardTop;
+    context.fillRect(0, 0, width, height);
+  }
+  context.restore();
+}
+
+// 传送门本体：呼吸光 + 标签 + 可点提示环（+ 首局箭头引导）
+// 过场蓄力：光圈收紧 + 门心越来越亮（只在过场里用，UI 已全部撤掉）
+function drawMenuPortalCharge(elapsed) {
+  const box = menuPortalScreen();
+  const intensity = portalChargeIntensity(elapsed);
+  context.save();
+  // 门心白光：蓄力越久越亮，铺满前先亮起来
+  const core = context.createRadialGradient(box.x, box.y, box.r * 0.1, box.x, box.y, box.r * (0.9 + intensity * 0.5));
+  core.addColorStop(0, 'rgba(255, 255, 255, ' + (0.35 + intensity * 0.6) + ')');
+  core.addColorStop(1, 'rgba(255, 248, 224, 0)');
+  context.fillStyle = core;
+  context.fillRect(0, 0, width, height);
+  // 光圈：从外圈往内收，收得越紧越亮
+  const ringRadius = box.r * (1.15 - intensity * 0.3);
+  context.strokeStyle = UI.warn;
+  context.lineWidth = 2 + intensity * 3;
+  context.globalAlpha = 0.3 + intensity * 0.6;
+  context.beginPath();
+  context.arc(box.x, box.y, ringRadius, 0, Math.PI * 2);
+  context.stroke();
+  context.globalAlpha = 0.2 + intensity * 0.5;
+  context.beginPath();
+  context.arc(box.x, box.y, ringRadius * 0.82, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+}
+
+function drawMenuPortal(t, characterName) {
+  const box = menuPortalScreen();
+  const breathe = 0.5 + Math.sin(t * 2.6) * 0.5;
+  context.save();
+  // 呼吸光环：外圈亮、内圈淡，跟着呼吸一起抖
+  const ringAlpha = 0.16 + breathe * 0.18;
+  context.strokeStyle = UI.warn;
+  context.lineWidth = 3;
+  context.globalAlpha = ringAlpha;
+  context.beginPath();
+  context.arc(box.x, box.y, box.r * (0.98 + breathe * 0.02), 0, Math.PI * 2);
+  context.stroke();
+  context.globalAlpha = ringAlpha * 0.55;
+  context.lineWidth = 2;
+  context.beginPath();
+  context.arc(box.x, box.y, box.r * 1.12, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+
+  // 标签 chip：贴在光圈下方，写清楚「点了会去哪」
+  const label = characterName ? '带' + characterName + '进入' : '进入传送门';
+  const chipWidth = Math.min(132, box.r * 1.5);
+  const chipHeight = 30;
+  const chipX = box.x - chipWidth / 2;
+  const chipY = box.y + box.r * 0.42;
+  drawCelButton({ x: chipX, y: chipY, width: chipWidth, height: chipHeight }, UI.paperSolid, 12);
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 13px sans-serif';
+  context.textAlign = 'center';
+  context.fillText(label, box.x, chipY + 20);
+
+  // 首局引导：箭头 + 文案，直到第一次从传送门进入
+  if (portalGuideAt) {
+    const bob = Math.sin(t * 4) * 4;
+    context.fillStyle = UI.leafDeep;
+    context.beginPath();
+    context.moveTo(box.x, chipY + 58 + bob);
+    context.lineTo(box.x - 9, chipY + 44 + bob);
+    context.lineTo(box.x + 9, chipY + 44 + bob);
+    context.closePath();
+    context.fill();
+    context.font = 'bold 12px sans-serif';
+    context.fillStyle = UI.ink;
+    context.fillText('点这里开始', box.x, chipY + 78 + bob);
+  }
+}
+
+function menuPortalStar(width, characterId) {
+  return { width: width, character: characterId };
+}
+
+function menuMechanicCard() {
+  const cardHeight = menuCompact() ? 150 : 168;
+  return { x: 20, y: height * 0.335, width: width - 40, height: cardHeight };
+}
+
+function menuConfirmBounds() {
+  const card = menuMechanicCard();
+  const buttonHeight = 36;
+  return {
+    confirm: { x: card.x + 16, y: card.y + card.height - buttonHeight - 10, width: 138, height: buttonHeight },
+    cancel: { x: card.x + card.width - 128, y: card.y + card.height - buttonHeight - 10, width: 112, height: buttonHeight },
+  };
+}
+
+// 小屏抽屉：把放不下的入口收进这里（开始清理 + 四个入口）
+function menuDrawerBounds() {
+  return { x: width * 0.16, y: height * 0.16, width: width * 0.68, height: Math.min(height * 0.62, 420) };
+}
+
+function menuDrawerItemBounds(index) {
+  const panel = menuDrawerBounds();
+  const itemHeight = 46;
+  return { x: panel.x + 14, y: panel.y + 56 + index * (itemHeight + 8), width: panel.width - 28, height: itemHeight };
+}
+// 选中光晕：key art 里的角色是烘焙像素、不能真的抬起来，所以「悬浮」由光晕/气泡/星点合成。
+// 渐变光晕 + 双圈脉动 + sin 浮动 5px + 6 个环绕星点。
+function drawMenuPickGlow(id, accent, t) {
+  const circle = menuHitCircles().find((item) => item.id === id);
+  if (!circle) return;
+  const box = menuHitScreen(circle);
+  const bob = Math.sin(t * 3.2) * 5;
+  const pulse = 1 + Math.sin(t * 2.1) * 0.03;
+  context.save();
+  // 径向渐变光晕（一次 fill）；老基础库没有 createRadialGradient 时退回实心圆 + 低 alpha
+  if (context.createRadialGradient) {
+    const gradient = context.createRadialGradient(box.x, box.y + bob, box.r * 0.55, box.x, box.y + bob, box.r * 1.45);
+    gradient.addColorStop(0, accent);
+    gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    context.fillStyle = gradient;
+    context.globalAlpha = 0.34 + Math.sin(t * 2.6) * 0.06;
+    context.beginPath();
+    context.arc(box.x, box.y + bob, box.r * 1.45, 0, Math.PI * 2);
+    context.fill();
+  } else {
+    context.globalAlpha = 0.22;
+    context.fillStyle = accent;
+    context.beginPath();
+    context.arc(box.x, box.y + bob, box.r * 1.2, 0, Math.PI * 2);
+    context.fill();
+  }
+  // 双圈脉动光环
+  [1.06, 1.16].forEach((factor, index) => {
+    context.globalAlpha = index === 0 ? 0.55 : 0.26;
+    context.strokeStyle = accent;
+    context.lineWidth = index === 0 ? 3 : 2;
+    context.beginPath();
+    context.arc(box.x, box.y + bob, box.r * factor * pulse, 0, Math.PI * 2);
+    context.stroke();
+  });
+  // 环绕星点
+  for (let i = 0; i < 6; i += 1) {
+    const angle = t * 0.9 + i / 6 * Math.PI * 2;
+    const radius = box.r * 1.22;
+    context.globalAlpha = 0.45 + Math.abs(Math.sin(t * 2 + i)) * 0.45;
+    context.fillStyle = accent;
+    context.beginPath();
+    context.arc(box.x + Math.cos(angle) * radius, box.y + bob + Math.sin(angle) * radius, 2.4, 0, Math.PI * 2);
+    context.fill();
+  }
+  context.restore();
+  // 名字气泡（跟着浮动）
+  const character = menuCharacter(id);
+  const bubbleWidth = 108;
+  const bubbleHeight = 26;
+  const bubbleX = box.x - bubbleWidth / 2;
+  const bubbleY = box.y + bob - box.r - bubbleHeight - 12;
+  drawCelButton({ x: bubbleX, y: bubbleY, width: bubbleWidth, height: bubbleHeight }, UI.paperSolid, 10);
+  context.fillStyle = UI.ink;
+  context.font = 'bold 12px sans-serif';
+  context.textAlign = 'center';
+  context.fillText(character.name + ' · 已选', box.x, bubbleY + 17);
+}
+
+function drawMenuSidebar(t) {
+  const bar = menuSidebarBounds();
+  const items = menuSidebarItems();
+  const expanded = menuSidebarExpanded;
+  context.save();
+  if (expanded) {
+    // 抽屉面板：半透明玻璃 + 淡描边（不抢画面，又能压住背后的角色）
+    const panelHeight = bar.panelBottom - bar.panelTop;
+    context.fillStyle = UI.cardShadow;
+    roundedRect(bar.panelLeft + 2, bar.panelTop + 4, bar.panelWidth, panelHeight, 14);
+    context.fillStyle = UI.glass;
+    roundedRect(bar.panelLeft, bar.panelTop, bar.panelWidth, panelHeight, 14);
+    context.strokeStyle = UI.glassEdge;
+    context.lineWidth = 1.5;
+    roundRectPath(bar.panelLeft + 1, bar.panelTop + 1, bar.panelWidth - 2, panelHeight - 2, 14);
+    context.stroke();
+  }
+  items.forEach((item, index) => {
+    const rect = menuSidebarIconRect(index);
+    // 图标：半透明玻璃底 + 深色字形（比上一版缩 20%，但触控区仍有 44 高）
+    drawCelButton(rect, expanded ? UI.paperSolid : UI.glassIcon, 10);
+    drawMenuGlyph(item.glyph, rect.x + rect.width / 2, rect.y + rect.height / 2, 17);
+    if (expanded) {
+      context.fillStyle = UI.ink;
+      context.font = 'bold 13px sans-serif';
+      context.textAlign = 'left';
+      context.textBaseline = 'middle';
+      context.fillText(item.label, bar.railWidth + 10, rect.y + rect.height / 2 + 1, bar.labelWidth - 4);
+      context.textBaseline = 'alphabetic';
+    }
+  });
+  context.restore();
+}
+function drawMenuMechanicCard(id) {
+  const character = menuCharacter(id);
+  const card = menuMechanicCard();
+  const buttons = menuConfirmBounds();
+  drawPaperPanel(card, 16);
+  context.fillStyle = UI.ink;
+  context.font = 'bold 19px sans-serif';
+  context.textAlign = 'left';
+  context.fillText(character.name, card.x + 16, card.y + 26);
+  context.fillStyle = UI.moss;
+  context.font = '12px sans-serif';
+  context.textAlign = 'right';
+  context.fillText(character.style, card.x + card.width - 16, card.y + 26);
+  const lines = characterMechanics[id] || [];
+  context.textAlign = 'left';
+  context.font = '13px sans-serif';
+  lines.forEach((line, index) => {
+    context.fillStyle = UI.ink;
+    context.fillText('· ' + line, card.x + 16, card.y + 54 + index * 24);
+  });
+  drawCelButton(buttons.confirm, UI.leaf, 12);
+  context.fillStyle = UI.paperSolid;
+  context.font = 'bold 15px sans-serif';
+  context.textAlign = 'center';
+  context.fillText('确定出战', buttons.confirm.x + buttons.confirm.width / 2, buttons.confirm.y + 23);
+  drawCelButton(buttons.cancel, UI.paperSolid, 12);
+  context.fillStyle = UI.moss;
+  context.font = '14px sans-serif';
+  context.fillText('再看看', buttons.cancel.x + buttons.cancel.width / 2, buttons.cancel.y + 23);
+}
+
+function drawMenuDrawer() {
+  const panel = menuDrawerBounds();
+  context.fillStyle = UI.scrim;
+  context.fillRect(0, 0, width, height);
+  drawPaperPanel(panel, 18);
+  context.fillStyle = UI.ink;
+  context.font = 'bold 18px sans-serif';
+  context.textAlign = 'left';
+  context.fillText('更多', panel.x + 16, panel.y + 30);
+  const items = [{ label: '角色面板', screen: 'stats' }].concat(menuSidebarItems().map((item) => ({ label: item.label, screen: item.screen })));
+  items.forEach((item, index) => {
+    const rect = menuDrawerItemBounds(index);
+    if (rect.y + rect.height > panel.y + panel.height - 12) return;
+    drawCelButton(rect, UI.paperSolid, 12);
+    context.fillStyle = UI.ink;
+    context.font = 'bold 15px sans-serif';
+    context.textAlign = 'left';
+    context.fillText(item.label, rect.x + 16, rect.y + 29);
+  });
+}
 function wardrobePanel() { return { x: 20, y: height * 0.14, width: width - 40, height: height * 0.70 }; }
 function gardenPanel() { return { x: 18, y: height * 0.12, width: width - 36, height: height * 0.76 }; }
 function codexPanel() { return { x: 16, y: height * 0.07, width: width - 32, height: height * 0.86 }; }
 function enemyCodexPanel() { return { x: 16, y: height * 0.055, width: width - 32, height: height * 0.89 }; }
 function backButtonBounds(panel) { return { x: panel.x + 12, y: panel.y + 11, width: 56, height: 32 }; }
+// 小院底部两个并排按钮：左「植物图鉴」，右「育苗」（种子出口）。
+// 宽度 152 + 间距 8 正好放进面板内宽 312，两个按钮都不压卡片（卡片底 513 / 按钮顶 535）。
+const GARDEN_BUTTON_WIDTH = 152;
 function plantCodexButtonBounds() {
   const panel = gardenPanel();
-  return { x: width / 2 - 82, y: panel.y + panel.height - 52, width: 164, height: 36 };
+  return { x: panel.x + 15, y: panel.y + panel.height - 52, width: GARDEN_BUTTON_WIDTH, height: 36 };
 }
-function pauseButtonBounds() { return { x: 12, y: 108, width: 64, height: 30 }; }
+function nurseryButtonBounds() {
+  const panel = gardenPanel();
+  return { x: panel.x + 15 + GARDEN_BUTTON_WIDTH + 8, y: panel.y + panel.height - 52, width: GARDEN_BUTTON_WIDTH, height: 36 };
+}
+function pauseButtonBounds() { return { x: 20, y: viewInsets.top + HUD_TOP_GAP + 8, width: 28, height: 28 }; }
 function pauseMenuBounds() {
   return {
-    resume: { x: width * 0.18, y: height * 0.44, width: width * 0.64, height: 52 },
-    settle: { x: width * 0.18, y: height * 0.55, width: width * 0.64, height: 52 },
+    resume: { x: width * 0.18, y: height * 0.42, width: width * 0.64, height: 52 },
+    stats: { x: width * 0.18, y: height * 0.42 + 60, width: width * 0.64, height: 46 },
+    settle: { x: width * 0.18, y: height * 0.42 + 116, width: width * 0.64, height: 52 },
   };
 }
 function resultButtonBounds() { return { x: 48, y: height * 0.64, width: width - 96, height: 52 }; }
 
+// ---- 角色面板布局 ----------------------------------------------------------------------
+// 面板占满安全区（上下各留 10px），宽 = 屏宽 - 24。
+function statsPanel() {
+  const top = viewInsets.top + 10;
+  return { x: 12, y: top, width: width - 24, height: height - top - viewInsets.bottom - 10 };
+}
+// 升级屏右上角的入口按钮；暂停屏里是第 2 个按钮（见 pauseMenuBounds）。
+// 角色面板入口放到左上角（右上角留给暂停/跳过类操作，左上更贴近标题视线）
+function statsOpenBounds() { return { x: 12, y: viewInsets.top + 10, width: 88, height: 30 }; }
+// 技能格：4 列 × 2 行，格子高度跟着面板高度走，保证属性表永远有位置。
+function statsSlotBounds(index) {
+  const panel = statsPanel();
+  const columns = 4;
+  const gap = 8;
+  const cellWidth = (panel.width - 32 - gap * (columns - 1)) / columns;
+  const cellHeight = 46;
+  return {
+    x: panel.x + 16 + (index % columns) * (cellWidth + gap),
+    y: panel.y + 100 + Math.floor(index / columns) * (cellHeight + 6),
+    width: cellWidth,
+    height: cellHeight,
+  };
+}
+// 属性表：左列读左半边，右列读右半边（和参考稿的排版一致）。
+function statsRowBounds(index, columnCount) {
+  const panel = statsPanel();
+  const rowsPerColumn = Math.ceil(columnCount / 2);
+  const top = panel.y + 224;
+  const bottom = panel.y + panel.height - 96;
+  const rowHeight = Math.max(20, Math.min(32, (bottom - top) / Math.max(1, rowsPerColumn)));
+  const columnWidth = (panel.width - 40) / 2;
+  const column = index < rowsPerColumn ? 0 : 1;
+  const row = column === 0 ? index : index - rowsPerColumn;
+  return {
+    x: panel.x + 20 + column * (columnWidth + 4),
+    y: top + row * rowHeight,
+    width: columnWidth - 4,
+    height: rowHeight,
+    rowHeight,
+  };
+}
+
 // ---- skill codex layout ----------------------------------------------------------------
 function skillCodexPanel() { return { x: 14, y: height * 0.04, width: width - 28, height: height * 0.92 }; }
+// 技能图鉴布局：固定头部（标题/说明/角色页签/主动技能）+ 可滚动双列列表 + 底部统计。
+// 原来行高按「24 项」硬算、且没有滚动，技能一多就会顶出屏幕上下边。
+function skillCodexItems(id) {
+  const skills = skillsForCharacter(id).slice();
+  const evolutions = (evolutionTable[id] || []).map((item) => ({ title: item.title, description: item.description, rarity: 'gold', evolution: true }));
+  return skills.concat(evolutions);
+}
+
+function skillCodexLayout() {
+  const panel = skillCodexPanel();
+  const titleTop = panel.y + 34;
+  const tabsTop = panel.y + 74;
+  const tabsHeight = 30;
+  const activeTop = tabsTop + tabsHeight + 16;
+  const listTop = activeTop + 26;
+  const footerHeight = 34;
+  const listBottom = panel.y + panel.height - footerHeight;
+  const columnWidth = (panel.width - 36) / 2;
+  const rowHeight = 46;
+  const rowGap = 5;
+  const items = skillCodexItems(skillCodexCharacter);
+  const rows = Math.ceil(items.length / 2);
+  const contentHeight = rows * (rowHeight + rowGap) - rowGap;
+  const viewHeight = Math.max(0, listBottom - listTop);
+  const maxScroll = Math.max(0, contentHeight - viewHeight);
+  return { panel, titleTop, tabsTop, tabsHeight, activeTop, listTop, listBottom, columnWidth, rowHeight, rowGap, items, rows, maxScroll, viewHeight, contentHeight };
+}
+
+function skillCodexScrollClamp(value) {
+  return Math.max(0, Math.min(skillCodexLayout().maxScroll, value));
+}
+
+// 当前详情对应的技能（skillCodexDetail 存的是索引，滑动时只改索引）
+function skillCodexDetailSkill() {
+  if (skillCodexDetail === null || skillCodexDetail === undefined) return null;
+  const items = skillCodexItems(skillCodexCharacter);
+  return items[skillCodexDetail] || null;
+}
+
+// 左右滑一格：夹住 0..n-1；到边界不循环（避免「滑不到底」的错觉）
+function skillCodexStepDetail(step) {
+  const items = skillCodexItems(skillCodexCharacter);
+  if (!items.length) return false;
+  const current = skillCodexDetail === null || skillCodexDetail === undefined ? 0 : skillCodexDetail;
+  const next = Math.max(0, Math.min(items.length - 1, current + step));
+  codexSwipeX = 0;
+  if (next === current) return false;
+  skillCodexDetail = next;
+  return true;
+}
+
+function skillCodexDetailPanel() {
+  return { x: 24, y: height * 0.24, width: width - 48, height: Math.min(height * 0.52, 360) };
+}
+
+function skillCodexDetailCloseBounds() {
+  const panel = skillCodexDetailPanel();
+  return { x: panel.x + panel.width / 2 - 70, y: panel.y + panel.height - 52, width: 140, height: 40 };
+}
+
+function skillCodexRowAt(x, y) {
+  const layout = skillCodexLayout();
+  if (y < layout.listTop || y > layout.listBottom) return null;
+  for (let index = 0; index < layout.items.length; index += 1) {
+    const row = skillCodexRowBounds(index);
+    if (insideRect(row, { clientX: x, clientY: y })) return index;
+  }
+  return null;
+}
 function skillCodexTabBounds(index) {
   const panel = skillCodexPanel();
   const gap = 6;
@@ -2641,17 +3795,14 @@ function skillCodexTabBounds(index) {
   return { x: panel.x + 12 + index * (tabWidth + gap), y: panel.y + 52, width: tabWidth, height: 32, id: characters[index].id };
 }
 function skillCodexRowBounds(index) {
-  const panel = skillCodexPanel();
-  const top = panel.y + 124;
-  const available = panel.y + panel.height - 34 - top;
-  const perColumn = Math.ceil(24 / 2);
-  const rowHeight = Math.min(50, available / perColumn);
-  const columnWidth = (panel.width - 34) / 2;
+  const layout = skillCodexLayout();
+  const column = index % 2;
+  const row = Math.floor(index / 2);
   return {
-    x: panel.x + 14 + (index % 2) * (columnWidth + 6),
-    y: top + Math.floor(index / 2) * rowHeight,
-    width: columnWidth,
-    height: rowHeight - 4,
+    x: layout.panel.x + 16 + column * (layout.columnWidth + 8),
+    y: layout.listTop + row * (layout.rowHeight + layout.rowGap) - skillCodexScroll,
+    width: layout.columnWidth,
+    height: layout.rowHeight,
   };
 }
 // Chinese text has no spaces, so wrapping is done by character budget - no measureText needed.
@@ -2667,95 +3818,177 @@ function drawWrappedText(text, x, y, maxWidth, lineHeight, maxLines, fontSize) {
 }
 function drawBackButton(panel) {
   const rect = backButtonBounds(panel);
-  context.fillStyle = '#315e37';
+  context.fillStyle = UI.leaf;
   roundedRect(rect.x, rect.y, rect.width, rect.height, 10);
-  context.fillStyle = '#fff7d9';
+  context.fillStyle = UI.cream;
   context.textAlign = 'center';
   context.font = 'bold 14px sans-serif';
   context.fillText('返回', rect.x + rect.width / 2, rect.y + 21);
 }
 
-function drawMenu() {
-  const layout = menuLayout();
-  const buttonX = layout.start.x;
-  const buttonY = layout.start.y;
-  const buttonWidth = layout.start.width;
-  const buttonHeight = layout.start.height;
-
-  context.fillStyle = '#b9df8b';
-  context.fillRect(width / 2 - width / (2 * gameWorldZoom), height / 2 - height / (2 * gameWorldZoom), width / gameWorldZoom, height / gameWorldZoom);
-  if (backgroundReady) {
-    const scale = Math.max(width / background.width, height / background.height);
-    const drawWidth = background.width * scale;
-    const drawHeight = background.height * scale;
-    context.drawImage(background, (width - drawWidth) / 2, (height - drawHeight) / 2, drawWidth, drawHeight);
+// 主菜单次按钮上的小图标（20px 视觉尺寸，纯路径，不占包体）。
+// 为什么用画而不是出图：四个图标各 20px，出图要 4 张 PNG（按 3 倍屏是 60px），
+// 加起来比这 40 行路径贵，而且图标只在菜单出现，不存在「每帧大量绘制」的性能问题。
+function drawMenuGlyph(kind, cx, cy, size) {
+  const s = size / 16;
+  context.save();
+  context.translate(cx, cy);
+  context.scale(s, s);
+  context.strokeStyle = UI.leaf;
+  context.fillStyle = UI.leaf;
+  context.lineWidth = 1.6;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  if (kind === 'wardrobe') {
+    // 衣架：挂钩 + 三角架
+    context.beginPath();
+    context.arc(0, -6.2, 2.1, Math.PI, Math.PI * 2);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(0, -4.1);
+    context.lineTo(0, -2.4);
+    context.moveTo(-6.4, 4.6);
+    context.lineTo(0, -2.4);
+    context.lineTo(6.4, 4.6);
+    context.closePath();
+    context.stroke();
+  } else if (kind === 'garden') {
+    // 叶子：斜椭圆 + 叶脉
+    context.save();
+    context.rotate(-Math.PI / 4);
+    context.beginPath();
+    context.ellipse(0, 0, 6.2, 3.4, 0, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+    context.strokeStyle = 'rgba(255, 250, 226, 0.9)';
+    context.beginPath();
+    context.moveTo(-4.4, 4.4);
+    context.lineTo(4.4, -4.4);
+    context.stroke();
+  } else if (kind === 'enemy') {
+    // 小怪：圆身子 + 两只眼 + 两根触角
+    context.beginPath();
+    context.arc(0, 1.6, 5.4, 0, Math.PI * 2);
+    context.fill();
+    context.strokeStyle = UI.leaf;
+    context.beginPath();
+    context.moveTo(-3.2, -3.4); context.lineTo(-5.6, -7.2);
+    context.moveTo(3.2, -3.4); context.lineTo(5.6, -7.2);
+    context.stroke();
+    context.fillStyle = 'rgba(255, 250, 226, 0.92)';
+    context.beginPath();
+    context.arc(-2.1, 0.4, 1.5, 0, Math.PI * 2);
+    context.arc(2.1, 0.4, 1.5, 0, Math.PI * 2);
+    context.fill();
+  } else {
+    // 书：封面 + 书脊 + 两行字
+    context.beginPath();
+    context.rect(-5.6, -6.4, 11.2, 12.8);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(-3.4, -6.4); context.lineTo(-3.4, 6.4);
+    context.moveTo(-1.4, -2); context.lineTo(3.6, -2);
+    context.moveTo(-1.4, 1.6); context.lineTo(3.6, 1.6);
+    context.stroke();
   }
-  context.fillStyle = 'rgba(255, 250, 226, 0.12)';
-  context.fillRect(0, 0, width, height);
-
-  context.fillStyle = '#274d2e';
-  context.textAlign = 'center';
-  context.font = 'bold 34px sans-serif';
-  context.lineWidth = 5;
-  context.strokeStyle = 'rgba(255, 255, 255, 0.82)';
-  context.strokeText('小院清理队', width / 2, height * 0.185);
-  context.fillText('小院清理队', width / 2, height * 0.185);
-
-  context.fillStyle = '#477a3c';
-  context.font = '16px sans-serif';
-  context.fillText('春日到了，来整理你的小院吧', width / 2, height * 0.228);
-  context.font = '14px sans-serif';
-  context.fillText(`最高 ${profile.bestTime} 秒 · 最多清理 ${profile.bestKills} 只 · ${profile.coins} 金币`, width / 2, height * 0.268);
-
-  context.font = 'bold 12px sans-serif'; context.fillStyle = '#315e37';
-  context.fillText('选择出战角色', width / 2, height * 0.305);
-  characters.forEach((character, index) => {
-    const card = characterCardBounds(index);
-    context.fillStyle = profile.character === character.id ? '#fff0ba' : 'rgba(255, 250, 226, 0.94)';
-    roundedRect(card.x, card.y, card.width, card.height, 12);
-    if (profile.character === character.id) { context.strokeStyle = '#c58e37'; context.lineWidth = 2; context.stroke(); }
-    context.textAlign = 'left'; context.fillStyle = '#315e37'; context.font = 'bold 14px sans-serif';
-    context.fillText(character.name, card.x + 10, card.y + 23);
-    context.font = '10px sans-serif'; context.fillStyle = '#71805c';
-    context.fillText(`${character.style} · ${character.description}`, card.x + 10, card.y + 41);
-    context.font = '9px sans-serif';
-    context.fillText(profile.character === character.id ? '已选择' : '点击选择', card.x + 10, card.y + 54);
-    const preview = getCharacterSprite(character.id);
-    const previewReady = isCharacterSpriteReady(character.id);
-    if (previewReady) {
-      const boxHeight = card.height - 12;
-      const boxWidth = boxHeight * preview.width / preview.height;
-      context.drawImage(preview, card.x + card.width - boxWidth - 6, card.y + 6, boxWidth, boxHeight);
-    }
-  });
-  context.textAlign = 'center';
-
-  context.fillStyle = '#315e37';
-  roundedRect(buttonX, buttonY, buttonWidth, buttonHeight, 16);
-  context.fillStyle = '#fff7d9';
-  context.font = 'bold 20px sans-serif';
-  context.fillText('开始清理', width / 2, buttonY + 38);
-  context.fillStyle = '#315e37';
-  context.fillStyle = 'rgba(255, 250, 226, 0.94)';
-  roundedRect(layout.wardrobe.x, layout.wardrobe.y, layout.wardrobe.width, layout.wardrobe.height, 14);
-  context.fillStyle = '#315e37';
-  context.font = 'bold 16px sans-serif';
-  context.fillText('装扮小院队员', width / 2, layout.wardrobe.y + 28);
-  context.fillStyle = 'rgba(255, 250, 226, 0.94)';
-  roundedRect(layout.garden.x, layout.garden.y, layout.garden.width, layout.garden.height, 14);
-  context.fillStyle = '#315e37';
-  context.font = 'bold 16px sans-serif';
-  context.fillText(`打理小院 · 种子 ${profile.seeds}`, width / 2, layout.garden.y + 28);
-  context.fillStyle = 'rgba(255, 250, 226, 0.94)';
-  roundedRect(layout.enemyCodex.x, layout.enemyCodex.y, layout.enemyCodex.width, layout.enemyCodex.height, 14);
-  context.fillStyle = '#315e37';
-  context.fillText('敌人图鉴 · 波次挑战', width / 2, layout.enemyCodex.y + 25);
-  context.fillStyle = 'rgba(255, 250, 226, 0.94)';
-  roundedRect(layout.skillCodex.x, layout.skillCodex.y, layout.skillCodex.width, layout.skillCodex.height, 14);
-  context.fillStyle = '#315e37';
-  context.fillText('技能图鉴 · 四角色全技能', width / 2, layout.skillCodex.y + 25);
+  context.restore();
 }
 
+function drawMenu() {
+  const layout = menuLayout();
+  const t = (Date.now() % 60000) / 1000;
+
+  context.fillStyle = '#b9df8b';
+  context.fillRect(0, 0, width, height);
+  // key art 优先；没加载完/失败退回原来的春日草地
+  const menuArt = menuKeyartReady ? menuKeyartSprite : (backgroundReady ? background : null);
+  if (menuArt) {
+    const scale = Math.max(width / menuArt.width, height / menuArt.height);
+    const drawWidth = menuArt.width * scale;
+    const drawHeight = menuArt.height * scale;
+    context.drawImage(menuArt, (width - drawWidth) / 2, (height - drawHeight) / 2, drawWidth, drawHeight);
+  }
+  // ---- 传送门过场：2 秒，期间只有主背景（UI 全撤），白屏那一帧才切战斗 ----
+  if (portalTransitionAt >= 0) {
+    const elapsed = Date.now() - portalTransitionAt;
+    if (elapsed >= portalSwitchMs) {
+      // 白光已经铺满：这一刻切到战斗，白光由 drawPortalFlash 继续褪出
+      portalTransitionAt = -1;
+      startGame();
+      return;
+    }
+    drawMenuPortalCharge(elapsed);
+    return;
+  }
+
+  // 顶部压暗保证标题与按钮可读；底部渐变压暗让角色脚部与提示分开
+  if (menuKeyartReady) {
+    const topScrim = context.createLinearGradient(0, 0, 0, height * 0.34);
+    topScrim.addColorStop(0, 'rgba(255, 250, 226, 0.32)');
+    topScrim.addColorStop(1, 'rgba(255, 250, 226, 0)');
+    context.fillStyle = topScrim;
+    context.fillRect(0, 0, width, height * 0.34);
+    const bottomScrim = context.createLinearGradient(0, height * 0.72, 0, height);
+    bottomScrim.addColorStop(0, 'rgba(255, 250, 226, 0)');
+    bottomScrim.addColorStop(1, 'rgba(255, 250, 226, 0.52)');
+    context.fillStyle = bottomScrim;
+    context.fillRect(0, height * 0.72, width, height * 0.28);
+  }
+  if (uiVignetteReady) {
+    context.save();
+    context.globalAlpha = 0.40;
+    context.drawImage(uiVignetteSprite, 0, 0, width, height);
+    context.restore();
+  }
+
+  // 默认预选：进菜单时把上次出战的角色点亮（只亮光晕，不弹卡）
+  if (!menuPick) menuPick = { id: profile.character, since: 0, confirmed: true };
+  const pickedId = menuPick ? menuPick.id : null;
+  if (pickedId) {
+    const circle = menuHitCircles().find((item) => item.id === pickedId);
+    drawMenuPickGlow(pickedId, circle ? circle.accent : UI.gold, t);
+  }
+
+  // ---- 顶部 UI（全部收在天空区，不压角色）----
+  context.textAlign = 'center';
+  context.font = 'bold 30px sans-serif';
+  context.lineWidth = 4;
+  context.strokeStyle = 'rgba(255, 255, 255, 0.86)';
+  context.fillStyle = UI.ink;
+  const titleY = menuCompact() ? viewInsets.top + 34 : height * 0.085;
+  context.strokeText('小院清理队', width / 2, titleY);
+  context.fillText('小院清理队', width / 2, titleY);
+  context.font = '13px sans-serif';
+  context.fillStyle = UI.leaf;
+  context.fillText('春日到了，来整理你的小院吧', width / 2, titleY + 24);
+  context.font = '12px sans-serif';
+  context.fillStyle = UI.moss;
+  context.fillText('最高 ' + fmtInt(profile.bestTime) + ' 秒 · 最多清理 ' + fmtInt(profile.bestKills) + ' 只 · ' + fmtInt(profile.coins) + ' 金币', width / 2, titleY + 44);
+
+  // 传送门 = 开始按钮：画面即入口。已确认角色时标签变成「带 XX 进入」
+  drawMenuPortal(t, menuPick && menuPick.confirmed ? menuCharacter(profile.character).name : null);
+
+  // 左侧图标栏（小屏收进右上角抽屉）
+  if (!menuCompact()) {
+    drawMenuSidebar(t);
+  } else {
+    const drawer = layout.drawerButton;
+    drawCelButton(drawer, UI.glassIcon, 12);
+    context.fillStyle = UI.leaf;
+    context.font = 'bold 18px sans-serif';
+    context.textAlign = 'center';
+    context.fillText('≡', drawer.x + drawer.width / 2, drawer.y + 26);
+  }
+  // 底部提示
+  context.fillStyle = UI.moss;
+  context.font = '12px sans-serif';
+  context.fillText('点传送门开始｜点角色换人｜左侧是管理入口', width / 2, height - 22);
+
+  // 机制卡（点中角色后）
+  if (menuPick && !menuPick.confirmed) drawMenuMechanicCard(menuPick.id);
+  // 小屏抽屉
+  if (menuDrawerOpen) drawMenuDrawer();
+}
 function gardenCardBounds(index) {
   const cardHeight = Math.min(100, height * 0.12);
   const cardWidth = (width - 66) / 2;
@@ -2802,102 +4035,179 @@ function drawGardenDecorationIcon(id, level, x, y, scale = 1) {
 function drawGarden() {
   drawMenu(); context.fillStyle = 'rgba(24, 47, 29, 0.76)'; context.fillRect(0, 0, width, height);
   const panel = gardenPanel();
-  context.fillStyle = '#fff7d9'; roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
-  context.textAlign = 'center'; context.fillStyle = '#315e37'; context.font = 'bold 24px sans-serif'; context.fillText('我的小院', width / 2, panel.y + 38);
+  drawPaperPanel(panel, 18);
+  context.textAlign = 'center'; context.fillStyle = UI.leaf; context.font = 'bold 24px sans-serif'; context.fillText('我的小院', width / 2, panel.y + 38);
   context.font = '14px sans-serif'; context.fillText(`种子 ${profile.seeds} · 8 种装饰，最高 10 级`, width / 2, panel.y + 62);
   gardenProjects.forEach((project, index) => {
     const card = gardenCardBounds(index); const level = profile.garden[project.id];
     context.fillStyle = '#edf3df'; roundedRect(card.x, card.y, card.width, card.height, 13); drawGardenPlot(project, level, card.x + 27, card.y + card.height * 0.65);
-    context.textAlign = 'left'; context.fillStyle = '#315e37'; context.font = 'bold 13px sans-serif'; context.fillText(project.name, card.x + 49, card.y + 24);
-    context.font = '10px sans-serif'; context.fillStyle = '#71805c'; context.fillText(`${project.short} ${project.buff(level)}`, card.x + 49, card.y + 43);
+    context.textAlign = 'left'; context.fillStyle = UI.leaf; context.font = 'bold 13px sans-serif'; context.fillText(project.name, card.x + 49, card.y + 24);
+    context.font = '10px sans-serif'; context.fillStyle = UI.moss; context.fillText(`${project.short} ${project.buff(level)}`, card.x + 49, card.y + 43);
     context.font = '11px sans-serif'; context.fillText(`等级 ${level}/10`, card.x + 49, card.y + 63);
-    const cost = 5 + level * 3; context.textAlign = 'right'; context.fillStyle = level >= 10 ? '#7a9861' : (profile.seeds >= cost ? '#b37c2e' : '#9b8470');
+    const cost = 5 + level * 3; context.textAlign = 'right'; context.fillStyle = level >= 10 ? '#7a9861' : (profile.seeds >= cost ? UI.amberDark : '#9b8470');
     context.font = 'bold 10px sans-serif'; context.fillText(level >= 10 ? '已满级' : `升 ${cost} 粒`, card.x + card.width - 7, card.y + 44);
   });
   const codex = plantCodexButtonBounds();
-  context.fillStyle = '#e8d7a9'; roundedRect(codex.x, codex.y, codex.width, codex.height, 11);
-  context.fillStyle = '#315e37'; context.font = 'bold 14px sans-serif'; context.textAlign = 'center';
-  context.fillText(`植物图鉴 ${profile.plants.filter((id) => id !== 'red-hidden').length}/12`, width / 2, codex.y + 23);
+  context.fillStyle = UI.board; roundedRect(codex.x, codex.y, codex.width, codex.height, 11);
+  context.fillStyle = UI.leaf; context.font = 'bold 13px sans-serif'; context.textAlign = 'center';
+  context.fillText(`图鉴 ${fmtInt(profile.plants.filter((id) => id !== 'red-hidden').length)}/12`, codex.x + codex.width / 2, codex.y + 23);
+  // 育苗：种子在装饰满级之后的出口（保底一株还没有的植物）
+  const nursery = nurseryButtonBounds();
+  context.fillStyle = nurseryOffer() ? UI.board : UI.boardMuted;
+  roundedRect(nursery.x, nursery.y, nursery.width, nursery.height, 11);
+  context.fillStyle = UI.leaf; context.font = 'bold 13px sans-serif';
+  context.fillText(nurseryLabel(), nursery.x + nursery.width / 2, nursery.y + 23);
   drawBackButton(panel);
-  context.fillStyle = '#71805c'; context.font = '11px sans-serif'; context.fillText('装饰等级和效果会同步到战斗地图', width / 2, panel.y + panel.height - 10);
+  context.fillStyle = nurseryMessage ? UI.amberDark : UI.moss; context.font = '11px sans-serif';
+  context.fillText(nurseryMessage || '装饰等级和效果会同步到战斗地图', width / 2, panel.y + panel.height - 10, panel.width - 24);
 }
 
+function drawSkillCodexDetail() {
+  const skill = skillCodexDetailSkill();
+  if (!skill) return;
+  const items = skillCodexItems(skillCodexCharacter);
+  const index = skillCodexDetail === null ? 0 : skillCodexDetail;
+  const panel = skillCodexDetailPanel();
+  context.fillStyle = 'rgba(16, 28, 20, 0.78)';
+  context.fillRect(0, 0, width, height);
+
+  // 卡片跟着手指横移；到边界时位移被压成 0.28 倍，有「拉不动」的手感
+  const atFirst = index <= 0;
+  const atLast = index >= items.length - 1;
+  let offset = codexSwipeX;
+  if ((atFirst && offset > 0) || (atLast && offset < 0)) offset *= 0.28;
+  context.save();
+  context.translate(offset, 0);
+  drawPaperPanel(panel, 18);
+  const rarity = skillRarity[skill.rarity] || skillRarity.white;
+  context.textAlign = 'left';
+  context.fillStyle = rarity.color;
+  context.font = 'bold 12px sans-serif';
+  context.fillText((skill.evolution ? '★ 进化技能' : rarity.label) + ' · 左右滑动切换', panel.x + 18, panel.y + 26);
+  context.fillStyle = UI.ink;
+  context.font = 'bold 18px sans-serif';
+  context.fillText(skill.title, panel.x + 18, panel.y + 54, panel.width - 36);
+  context.fillStyle = UI.moss;
+  context.font = '12px sans-serif';
+  drawWrappedText(skill.description, panel.x + 18, panel.y + 82, panel.width - 36, 18, 8, 12);
+  if (skill.evolution) {
+    context.fillStyle = UI.amberDark;
+    context.font = '11px sans-serif';
+    context.fillText('由同名技能升到满级后进化而来', panel.x + 18, panel.y + panel.height - 70);
+  }
+  const close = skillCodexDetailCloseBounds();
+  drawCelButton(close, UI.leaf, 12);
+  context.textAlign = 'center';
+  context.fillStyle = UI.cream;
+  context.font = 'bold 15px sans-serif';
+  context.fillText('关闭', close.x + close.width / 2, close.y + 26);
+  context.restore();
+
+  // 页码 + 滑动提示：画在卡片内部（画在卡片外会压在底层列表上）
+  context.textAlign = 'right';
+  context.fillStyle = UI.moss;
+  context.font = 'bold 11px sans-serif';
+  context.fillText(String(index + 1) + ' / ' + String(items.length), panel.x + panel.width - 18, panel.y + 26);
+  if (!atFirst) {
+    context.fillStyle = UI.cream;
+    context.font = 'bold 22px sans-serif';
+    context.fillText('‹', panel.x - 6, panel.y + panel.height / 2);
+  }
+  if (!atLast) {
+    context.fillStyle = UI.cream;
+    context.font = 'bold 22px sans-serif';
+    context.fillText('›', panel.x + panel.width + 6, panel.y + panel.height / 2);
+  }
+}
+
+// 页码位置：卡片上方 22px（单独抽出来，测试里也能复用）
+function groupY() {
+  return Math.max(18, skillCodexDetailPanel().y - 14);
+}
 function drawSkillCodex() {
   drawMenu();
   context.fillStyle = 'rgba(24, 47, 29, 0.8)';
   context.fillRect(0, 0, width, height);
-  const panel = skillCodexPanel();
-  context.fillStyle = '#fff7d9';
-  roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
-  context.textAlign = 'center';
-  context.fillStyle = '#315e37';
-  context.font = 'bold 21px sans-serif';
-  context.fillText('技能图鉴', width / 2, panel.y + 30);
-  context.font = '10px sans-serif';
-  context.fillStyle = '#71805c';
-  context.fillText('切换角色查看其全部可获得技能与进化路线', width / 2, panel.y + 45);
+  const layout = skillCodexLayout();
+  const panel = layout.panel;
+  drawPaperPanel(panel, 18);
 
-  // character tabs
+  // ---- 固定头部 ----
+  context.textAlign = 'center';
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 21px sans-serif';
+  context.fillText('技能图鉴', width / 2, layout.titleTop);
+  context.fillStyle = UI.moss;
+  context.font = '10px sans-serif';
+  context.fillText('点技能看详情 · 上下拖动查看更多', width / 2, layout.titleTop + 16);
+
   characters.forEach((character, index) => {
     const tab = skillCodexTabBounds(index);
     const active = skillCodexCharacter === character.id;
-    context.fillStyle = active ? '#477a3c' : '#edf3df';
-    roundedRect(tab.x, tab.y, tab.width, tab.height, 9);
-    context.fillStyle = active ? '#fff7d9' : '#315e37';
+    drawCelButton(tab, active ? UI.leaf : UI.paperSolid, 9);
+    context.fillStyle = active ? UI.cream : UI.leaf;
     context.font = 'bold 12px sans-serif';
     context.textAlign = 'center';
     context.fillText(character.name, tab.x + tab.width / 2, tab.y + 21);
   });
 
-  // active skill + summary
-  const activeInfo = {
-    supreme: '主动：冲刺（冲撞伤害，冷却 4.5 秒）',
-    rabbit: '主动：粽子手雷（按生命百分比范围伤害 + 范围眩晕）',
-    daxia: `主动：无极闪（CD ${balance.wuxianCooldown} 秒，攻击力 500% 全屏刀光）`,
-    xiaoxian: `主动：伞回（CD ${balance.sanhuiCooldown} 秒，12 把伞各 120% 攻击力）`,
-  };
   context.textAlign = 'left';
-  context.fillStyle = '#b37c2e';
+  context.fillStyle = UI.amberDark;
   context.font = 'bold 10px sans-serif';
-  context.fillText(activeInfo[skillCodexCharacter], panel.x + 14, panel.y + 100);
-  context.textAlign = 'left';
-  context.fillStyle = '#71805c';
+  context.fillText(characterActiveSkills[skillCodexCharacter], panel.x + 16, layout.activeTop);
+  context.fillStyle = UI.moss;
   context.font = '9px sans-serif';
-  context.fillText(characterCodices[skillCodexCharacter], panel.x + 14, panel.y + 114);
+  context.fillText(characterCodices[skillCodexCharacter], panel.x + 16, layout.activeTop + 14);
 
-  // skills, then evolutions
-  const skills = skillsForCharacter(skillCodexCharacter).slice();
-  const evolutions = (evolutionTable[skillCodexCharacter] || []).map((e) => ({ title: e.title, description: e.description, rarity: 'gold' }));
-  const all = skills.concat(evolutions);
-  all.forEach((skill, index) => {
+  // ---- 列表（裁剪，超出部分靠滚动）----
+  context.save();
+  roundRectPath(panel.x + 8, layout.listTop - 4, panel.width - 16, layout.listBottom - layout.listTop + 8, 10);
+  context.clip();
+  layout.items.forEach((skill, index) => {
     const row = skillCodexRowBounds(index);
-    const rarity = skillRarity[skill.rarity];
-    context.fillStyle = skill.evolution ? '#fff2cd' : '#f2f6ea';
+    if (row.y + row.height < layout.listTop - 4 || row.y > layout.listBottom + 4) return;
+    const rarity = skillRarity[skill.rarity] || skillRarity.white;
+    context.fillStyle = skill.evolution ? '#fff2cd' : UI.paperSolid;
     roundedRect(row.x, row.y, row.width, row.height, 8);
     context.fillStyle = rarity.color;
-    context.fillRect(row.x, row.y + 3, 3, row.height - 6);
+    roundedRect(row.x + 6, row.y + 6, 3, row.height - 12, 2);
     context.textAlign = 'left';
     context.fillStyle = rarity.color;
     context.font = 'bold 10px sans-serif';
-    context.fillText(`${skill.evolution ? '★进化' : rarity.label} · ${skill.title}`, row.x + 9, row.y + 15, row.width - 14);
-    context.fillStyle = '#6b7956';
+    context.fillText((skill.evolution ? '★进化 · ' : '') + skill.title, row.x + 14, row.y + 16, row.width - 20);
+    context.fillStyle = UI.inkSoft;
     context.font = '8px sans-serif';
-    drawWrappedText(skill.description, row.x + 9, row.y + 27, row.width - 16, 10, 2, 8);
+    drawWrappedText(skill.description, row.x + 14, row.y + 28, row.width - 20, 10, 2, 8);
   });
+  context.restore();
 
-  context.fillStyle = '#71805c';
-  context.font = '9px sans-serif';
+  // ---- 滚动条 ----
+  if (layout.maxScroll > 0) {
+    const trackTop = layout.listTop;
+    const trackHeight = layout.listBottom - layout.listTop;
+    const thumbHeight = Math.max(24, trackHeight * (layout.viewHeight / layout.contentHeight));
+    const ratio = skillCodexScroll / layout.maxScroll;
+    context.fillStyle = UI.boardMuted;
+    roundedRect(panel.x + panel.width - 10, trackTop, 4, trackHeight, 2);
+    context.fillStyle = UI.leafLight;
+    roundedRect(panel.x + panel.width - 10, trackTop + (trackHeight - thumbHeight) * ratio, 4, thumbHeight, 2);
+  }
+
+  // ---- 底部统计 ----
   context.textAlign = 'center';
-  context.fillText(`共 ${all.length} 项（含 ${evolutions.length} 条进化）`, width / 2, panel.y + panel.height - 26);
-  drawBackButton(panel);
-}
+  context.fillStyle = UI.moss;
+  context.font = '9px sans-serif';
+  context.fillText('共 ' + String(layout.items.length) + ' 项（含 ' + String(layout.items.filter((item) => item.evolution).length) + ' 条进化）', width / 2, layout.listBottom + 20);
 
+  drawBackButton(panel);
+  drawSkillCodexDetail();
+}
 function drawEnemyCodex() {
   drawMenu(); context.fillStyle = 'rgba(24, 47, 29, 0.78)'; context.fillRect(0, 0, width, height);
   const panel = enemyCodexPanel();
-  context.fillStyle = '#fff7d9'; roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
-  context.textAlign = 'center'; context.fillStyle = '#315e37'; context.font = 'bold 22px sans-serif'; context.fillText('敌人图鉴', width / 2, panel.y + 34);
-  context.font = '11px sans-serif'; context.fillStyle = '#71805c'; context.fillText(`每 ${balance.waveDuration} 秒进入新波次，完成击杀目标可获得种子`, width / 2, panel.y + 55);
+  drawPaperPanel(panel, 18);
+  context.textAlign = 'center'; context.fillStyle = UI.leaf; context.font = 'bold 22px sans-serif'; context.fillText('敌人图鉴', width / 2, panel.y + 34);
+  context.font = '11px sans-serif'; context.fillStyle = UI.moss; context.fillText(`每 ${balance.waveDuration} 秒进入新波次，完成击杀目标可获得种子`, width / 2, panel.y + 55);
   const cardHeight = Math.min(112, height * 0.132); const cardWidth = (width - 60) / 2;
   enemyCatalog.forEach((enemy, index) => {
     const x = 24 + (index % 2) * (cardWidth + 10); const y = panel.y + 68 + Math.floor(index / 2) * (cardHeight + 7);
@@ -2909,14 +4219,14 @@ function drawEnemyCodex() {
       context.fillStyle = seen ? '#9b7459' : '#c5bfaf'; context.beginPath(); context.arc(x + 32, y + cardHeight / 2, 17, 0, Math.PI * 2); context.fill();
       context.fillStyle = '#fff'; context.font = 'bold 14px sans-serif'; context.fillText(seen ? '✓' : '?', x + 32, y + cardHeight / 2 + 5);
     }
-    context.textAlign = 'left'; context.fillStyle = '#315e37'; context.font = 'bold 12px sans-serif';
+    context.textAlign = 'left'; context.fillStyle = UI.leaf; context.font = 'bold 12px sans-serif';
     context.fillText(seen ? enemy.name : '未发现敌人', x + 62, y + 26);
-    context.fillStyle = '#71805c'; context.font = '9px sans-serif';
+    context.fillStyle = UI.moss; context.font = '9px sans-serif';
     context.fillText(seen ? enemy.description : '推进波次后遭遇', x + 62, y + 45);
     context.fillText(`击败 ${kills} 次`, x + 62, y + 63);
   });
   drawBackButton(panel);
-  context.fillStyle = '#71805c'; context.font = '10px sans-serif'; context.fillText(`首领约 ${(balance.bossSpawnTime / 60).toFixed(1)} 分钟后准时登场 · 精英怪从后期波次出现`, width / 2, panel.y + panel.height - 12);
+  context.fillStyle = UI.moss; context.font = '10px sans-serif'; context.fillText(`首领约 ${fmtInt(balance.bossSpawnTime / 60)} 分钟后准时登场 · 精英怪从后期波次出现`, width / 2, panel.y + panel.height - 12);
 }
 
 function drawPlantIcon(plant, x, y, size, pulse = 0) {
@@ -2939,11 +4249,13 @@ function codexCardBounds(index) {
 }
 
 // The "attack speed" plant bonus lands on whatever each kit actually uses.
+// 两个小数型收益改用「毫秒 / 千分位向下取整后再向上取整」，保证界面上不出现小数点，
+// 也不会因为取整变成 +0（那会让玩家以为这个植物没用）。
 function plantSpeedLabel(perUnit) {
-  if (profile.character === 'rabbit') return `射击间隔 -${(perUnit * 0.16).toFixed(3)}秒`;
-  if (profile.character === 'daxia') return `刀光速度 +${Math.round(perUnit * 12)}`;
-  if (profile.character === 'xiaoxian') return `伞旋转伤害 +${(perUnit * 0.04).toFixed(3)}`;
-  return `棍子转速 +${perUnit}`;
+  if (profile.character === 'rabbit') return `射击间隔 -${fmtCeil(perUnit * 160)} 毫秒`;
+  if (profile.character === 'daxia') return `刀光速度 +${fmtInt(perUnit * 12)}`;
+  if (profile.character === 'xiaoxian') return `伞旋转伤害每秒 +${fmtCeil(perUnit * 40)}‰`;
+  return `棍子转速 +${fmtInt(perUnit)}`;
 }
 
 function plantBonusLabel(plant) {
@@ -2961,8 +4273,8 @@ function plantSetBonusLabel(setId) {
 function drawCodex() {
   drawMenu(); context.fillStyle = 'rgba(24, 47, 29, 0.78)'; context.fillRect(0, 0, width, height);
   const panel = codexPanel();
-  context.fillStyle = '#fff7d9'; roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
-  context.textAlign = 'center'; context.fillStyle = '#315e37'; context.font = 'bold 22px sans-serif'; context.fillText('稀有植物图鉴', width / 2, panel.y + 35);
+  drawPaperPanel(panel, 18);
+  context.textAlign = 'center'; context.fillStyle = UI.leaf; context.font = 'bold 22px sans-serif'; context.fillText('稀有植物图鉴', width / 2, panel.y + 35);
   const blue = plantSetCount('blue'); const purple = plantSetCount('purple'); const gold = plantSetCount('gold');
   context.font = '11px sans-serif'; context.fillText(`蓝套 ${blue}/3 · 紫套 ${purple}/4 · 金套 ${gold}/5（集齐激活套装加成）`, width / 2, height * 0.205);
   plantCatalog.forEach((plant, index) => {
@@ -2970,16 +4282,16 @@ function drawCodex() {
     context.fillStyle = found ? '#edf3df' : '#f4f0e4'; roundedRect(card.x, card.y, card.width, card.height, 10);
     if (found || !plant.hidden) drawPlantIcon(plant, card.x + 23, card.y + 26, 13);
     else { context.fillStyle = '#c2bcae'; context.beginPath(); context.arc(card.x + 23, card.y + 26, 12, 0, Math.PI * 2); context.fill(); context.fillStyle = '#fff'; context.font = 'bold 13px sans-serif'; context.textAlign = 'center'; context.fillText('?', card.x + 23, card.y + 31); }
-    context.textAlign = 'left'; context.fillStyle = '#315e37'; context.font = 'bold 11px sans-serif';
+    context.textAlign = 'left'; context.fillStyle = UI.leaf; context.font = 'bold 11px sans-serif';
     context.fillText(plant.hidden && !found ? '隐藏植物' : plant.name, card.x + 42, card.y + 24);
-    context.fillStyle = found ? '#71805c' : '#a29b8d'; context.font = '9px sans-serif';
+    context.fillStyle = found ? UI.moss : '#a29b8d'; context.font = '9px sans-serif';
     context.fillText(found ? plantBonusLabel(plant) : (plant.hidden ? '首领有 30% 概率掉落' : '地图中随机出现'), card.x + 42, card.y + 43);
     if (plant.set && found && plantSetCount(plant.set) >= plantSets[plant.set].count) {
       context.textAlign = 'right'; context.fillStyle = plantColors[plant.rarity]; context.font = 'bold 9px sans-serif'; context.fillText('套装已激活', card.x + card.width - 5, card.y + 14);
     }
   });
   drawBackButton(panel);
-  context.fillStyle = '#71805c'; context.font = '10px sans-serif';
+  context.fillStyle = UI.moss; context.font = '10px sans-serif';
   context.fillText(`套装加成：蓝 ${plantSetBonusLabel('blue')} · 紫 ${plantSetBonusLabel('purple')} · 金 ${plantSetBonusLabel('gold')}`, width / 2, panel.y + panel.height - 12, panel.width - 24);
 }
 
@@ -3029,10 +4341,10 @@ function drawWardrobe() {
   context.fillStyle = 'rgba(24, 47, 29, 0.72)';
   context.fillRect(0, 0, width, height);
   const panel = wardrobePanel();
-  context.fillStyle = '#fff7d9';
-  roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
+  context.fillStyle = UI.cream;
+  drawPaperPanel(panel, 18);
   context.textAlign = 'center';
-  context.fillStyle = '#315e37';
+  context.fillStyle = UI.leaf;
   context.font = 'bold 24px sans-serif';
   context.fillText('队员装扮', width / 2, panel.y + 36);
   context.font = '14px sans-serif';
@@ -3051,23 +4363,23 @@ function drawWardrobe() {
       context.restore();
     }
     context.textAlign = 'left';
-    context.fillStyle = '#315e37';
+    context.fillStyle = UI.leaf;
     context.font = 'bold 16px sans-serif';
     context.fillText(appearance.name, card.x + 72, card.y + 32);
     context.font = '13px sans-serif';
-    context.fillStyle = '#71805c';
+    context.fillStyle = UI.moss;
     context.fillText(appearance.price ? `解锁价格 ${appearance.price} 金币` : '初始外观', card.x + 72, card.y + 56);
     const isUnlocked = profile.unlockedSkins.includes(appearance.id);
     const label = isUnlocked ? (profile.skin === appearance.id ? '已装备' : '使用')
       : profile.coins >= appearance.price ? '解锁' : `差 ${appearance.price - profile.coins} 金币`;
     context.textAlign = 'right';
-    context.fillStyle = isUnlocked && profile.skin === appearance.id ? '#7a9861' : '#b37c2e';
+    context.fillStyle = isUnlocked && profile.skin === appearance.id ? '#7a9861' : UI.amberDark;
     context.font = 'bold 13px sans-serif';
     context.fillText(label, card.x + card.width - 12, card.y + 46);
   });
 
   context.textAlign = 'center';
-  context.fillStyle = '#477a3c';
+  context.fillStyle = UI.leafLight;
   context.font = '15px sans-serif';
   context.fillText('点击左上角返回', width / 2, panel.y + panel.height - 18);
   drawBackButton(panel);
@@ -3075,6 +4387,89 @@ function drawWardrobe() {
 
 function gardenBuff(id) {
   return gardenProjects.find((item) => item.id === id).buff(profile.garden[id]);
+}
+
+// ---- 经济：种子出口（育苗） -------------------------------------------------------------
+// 随机给一株「还没有的」植物，按稀有度定价。它解决的是「差一株就成套、但只能靠掉率」的挫败，
+// 也是八种装饰满级之后种子仍然有用的地方。红隐藏植物不卖 —— 那株必须自己打出来。
+let nurseryMessage = null;
+
+function nurseryPool(rarity) {
+  return plantCatalog.filter((plant) => plant.rarity === rarity && plant.set
+    && profile.plants.indexOf(plant.id) < 0);
+}
+
+// 当前可育苗的最便宜档位；三档都集齐则返回 null（按钮变成「植物已集齐」）
+function nurseryOffer() {
+  for (const rarity of ['blue', 'purple', 'gold']) {
+    const pool = nurseryPool(rarity);
+    if (pool.length) return { rarity, pool, price: balance.nurseryPrices[rarity] };
+  }
+  return null;
+}
+
+function nurseryLabel() {
+  const offer = nurseryOffer();
+  if (!offer) return '植物已集齐';
+  if (profile.seeds < offer.price) return `育苗 差 ${fmtInt(offer.price - profile.seeds)} 粒`;
+  return `育苗 ${fmtInt(offer.price)} 粒`;
+}
+
+function tryNursery() {
+  const offer = nurseryOffer();
+  if (!offer) { nurseryMessage = '三档植物都已集齐，红隐藏植物只能打出来'; return null; }
+  if (profile.seeds < offer.price) {
+    nurseryMessage = `种子不够：还差 ${fmtInt(offer.price - profile.seeds)} 粒`;
+    return null;
+  }
+  const plant = offer.pool[Math.floor(Math.random() * offer.pool.length)];
+  profile.seeds -= offer.price;
+  profile.plants.push(plant.id);
+  nurseryMessage = `育苗成功：${plant.name}（${plantSets[plant.set].name} ${plantSetCount(plant.set)}/${plantSets[plant.set].count}）`;
+  saveProfile();
+  return plant;
+}
+
+// ---- 经济：金币出口（重抽） -------------------------------------------------------------
+// 每次升级没抽到想要的，可以花金币重抽。价格 = 1 × 2^(本次升级已重抽次数)，每次升级重置回 1 金币，
+// 没有次数上限，只有指数增长的代价。目的：把「反悔」定价成曲线，而不是硬性 3 次封顶 ——
+// 前期几乎免费（1、2、4），想硬刷就要付 16/32/64…，值不值由玩家自己判断。
+function rerollCost() {
+  const base = balance.rerollBaseCost;
+  const count = game ? game.rerollCount : 0;
+  return Math.min(balance.rerollCostCeiling, base * Math.pow(2, count));
+}
+
+// 每次升级重置：新一级重新从 1 金币开始
+function resetRerollForNewLevel() {
+  if (game) game.rerollCount = 0;
+}
+
+// 重抽按钮：正常贴屏幕底部，但 4 张卡时卡片会占到约 571，所以取「最后一张卡下方 10px」
+// 与「屏幕底部上方 78px」的较大者，再夹一道不出屏的上限 —— 小屏靠前者、大屏靠后者。
+function rerollButtonBounds() {
+  const count = game && game.upgradeChoices ? game.upgradeChoices.length : 4;
+  const lastCard = count > 0 ? upgradeCardBounds(count - 1) : null;
+  const belowCards = lastCard ? lastCard.y + lastCard.height + 10 : 0;
+  const bottomAnchored = height - viewInsets.bottom - 78;
+  const maxY = height - viewInsets.bottom - 64;
+  return { x: width / 2 - 110, y: Math.min(maxY, Math.max(belowCards, bottomAnchored)), width: 220, height: 40 };
+}
+
+function rerollLabel() {
+  const cost = rerollCost();
+  if (profile.coins < cost) return `重抽 差 ${fmtInt(cost - profile.coins)} 金币`;
+  return `重抽 ${fmtInt(cost)} 金币`;
+}
+
+function tryReroll() {
+  const cost = rerollCost();
+  if (!game || profile.coins < cost) return false;
+  profile.coins -= cost;
+  game.rerollCount += 1;
+  game.upgradeChoices = chooseUpgrades();
+  saveProfile();
+  return true;
 }
 
 function startGame() {
@@ -3129,7 +4524,8 @@ function startGame() {
     alternateShotChance: 0,
     projectilePierce: 0,
     projectileSpeed: balance.startingProjectileSpeed,
-    projectileTurnRate: balance.startingProjectileTurnRate,
+    projectileTurnRate: balance.startingProjectileTurnRate,   // 兼容字段，直线弹道不再使用
+    bulletRangeBonus: 0,
     attackRange: balance.startingAttackRange,
     attackSpeedMultiplier: 1,
     characterPowerMultiplier: 1,
@@ -3138,6 +4534,7 @@ function startGame() {
     fireInterval: Math.max(characterStatCaps.fireInterval, balance.startingFireInterval - (profile.character === 'rabbit' ? plantBonuses.orbitSpeed * 0.16 : 0)),
     plantSpawnTimer: balance.plantSpawnFirst,
     plantNotice: null,
+    hudToast: null,
     victoryPending: false,
     victoryTimer: 0,
     damageNumbers: [],
@@ -3176,13 +4573,70 @@ function startGame() {
     spawnTimer: 0,
     damageCooldown: 0,
     dashTimer: 0,
-    dashCooldown: 0,
+    dashCooldown: 0,             // 兼容字段（至尊奶不再使用）
     dashCooldownMax: Math.max(1.6, balance.dashCooldown - gardenBuff('path') - plantBonuses.dashCooldown),
+    // ---- 充能系统（至尊奶）----
+    dashCharges: balance.dashChargeMaxBase,
+    dashChargeMax: balance.dashChargeMaxBase,
+    dashChargeTimer: 0,
+    dashRecharge: Math.max(1.6, balance.dashRecharge - gardenBuff('path') - plantBonuses.dashCooldown),
+    redChargeBonusGranted: false,
+    stickChargeBonusGranted: false,
     dashX: 0,
     dashY: 0,
     dashBonusDamage: 0,
+    dashGhosts: [],            // 冲刺残影（{x,y,facing,life}）
+    dashGhostTimer: 0,
+    dashRodBonus: 0,           // 棍势：临时增加的棍子数
+    dashRodTimer: 0,
+    dashInvulnTimer: 0,
+    dashFirstHit: false,       // 本次冲刺是否已经触发过顿帧/震屏
+    dashReadyAt: -999,         // 上次冷却转好的时间（技能键脉冲用）
+    // ---- 冲刺瞄准 v3 ----
+    lastMoveX: 0,              // 方向记忆：最后一次有意义的移动方向
+    lastMoveY: 0,
+    lastMoveAt: -99999,
+    aimActive: false,          // 是否在 0.1x 瞄准态
+    aimHoldStart: 0,           // 技能键按下的真实时间
+    aimRawX: 0,                // 手指原始位置（准星按它偏离技能键）
+    aimRawY: 0,
+    aimTarget: null,          // 当前锁定的敌人
+    aimSnapTier: -1,
+    grenadeAimTarget: null,    // 手雷瞄准锁定的敌人
+    grenadeAimOverdrag: false, // 拖出 1.5×所需行程（松手取消）           // 当前吸附的档位索引（-1 = 连续）
+    aimOverdrag: false,        // 是否拖出 1.5 倍上限（松手取消）
+    // ---- 至尊奶平衡 v3 ----
+    rodMeter: 0,               // 棍意：棍击攒层（≤3），冲刺消耗
+    rodMeterCooldown: 0,
+    dashRodPower: 0,           // 本次冲刺消耗的棍意层数
+    resonanceHits: 0,          // 棍阵共鸣：每 3 次棍击触发冲击波
+    dashSpinTimer: 0,          // 回旋余劲：冲刺后 2 秒转速 +40%
+    lightningDamageMult: 1,    // 赤霄：雷暴伤害倍率
+    armorBreakPerHit: 1,       // 每次击退叠的破甲层数
+    armorBreakLifeBonus: 0,
+    offenseDrought: 0,         // 连续多少级没拿到输出卡
     upgradeChoices: [],
     pendingUpgrade: null,
+    // 角色面板的数据源：升级确认「真的吃到」时才记录，用来做装备格与技能等级。
+    upgradeLog: [],
+    // 本次升级已重抽次数（每次升级清零；价格 = 1 × 2^n，见 rerollCost）
+    rerollCount: 0,
+    // 氛围粒子与时段（纯视觉，不参与任何数值）
+    ambient: [],
+    ambientTimer: 0,
+    // 近期 DPS 估计（首领血量 = 它 x bossFightSeconds）
+    damageThisSecond: 0,
+    damageDealtTotal: 0,
+    // 稀有度伤害乘区（见 scaleCharacterStats）：金 ×1.1 / 红 ×2.5，与生命无关。
+    rarityDamageMultiplier: 1,
+    dpsEstimate: 0,
+    dpsTimer: 0,
+    // 首局引导：0=教移动 1=教自动攻击 2=教选卡 3=已完成（老存档直接 3）
+    coachStep: profile.tutorialDone ? 3 : 0,
+    coachMoved: 0,
+    // 致命伤记录：damagePlayer 写入，结算页用来做复盘
+    lastHit: null,
+    deathCause: null,
     goldPicks: 0,
     redPicks: 0,
     combo: 0,
@@ -3266,9 +4720,20 @@ function startGame() {
     lightningCooldown: 0,
   };
   joystickTouchId = null;
+  skillTouchId = null;
   joystickOrigin = null;
+  // 每局重置性能采样，否则结算页会把上一局的帧率混进来
+  resetPerf();
   screen = 'game';
   draw();
+  startLoop();
+}
+
+// 从「静态屏」（stats / bossChoice / menu / 图鉴…）回到需要每帧更新的屏幕时，必须重新拉起循环：
+// 循环在静态屏会自己停掉（loopRunning = false），不重启就卡在最后一帧，
+// 直到「暂停 → 继续」把它重新拉起来 —— 用户报的两个卡死都是这个原因。
+function resumeLoop() {
+  lastFrameTime = 0;
   startLoop();
 }
 
@@ -3336,6 +4801,10 @@ function updatePlantDrops(delta) {
       game.plantSpawnTimer = Math.max(9, 22 + Math.random() * 12 - profile.garden.lantern * 1.1);
     }
   }
+  if (game.hudToast) {
+    game.hudToast.life -= delta;
+    if (game.hudToast.life <= 0) game.hudToast = null;
+  }
   if (game.plantNotice) {
     game.plantNotice.life -= delta;
     if (game.plantNotice.life <= 0) game.plantNotice = null;
@@ -3373,6 +4842,14 @@ function updateCamera() {
 function gameLoop(timestamp) {
   let delta = lastFrameTime ? Math.min((timestamp - lastFrameTime) / 1000, 0.05) : 0;
   lastFrameTime = timestamp;
+  notePerfFrame(timestamp);
+  // 过场：只画（画里自己处理蓄力/白光），不跑游戏逻辑
+  if (screen === 'menu' && portalTransitionAt >= 0) {
+    draw();
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
   if (screen === 'result') {
     // Keep animating so the result screen can roll its numbers up.
     if (game) game.resultTimer += delta;
@@ -3396,7 +4873,10 @@ function gameLoop(timestamp) {
   }
   draw();
 
-  if (screen === 'game' || screen === 'upgrade' || screen === 'upgradeDetail' || screen === 'upgradeConfirm' || screen === 'paused' || screen === 'result') requestAnimationFrame(gameLoop);
+  // 传送过场期间主界面也在动（蓄力 → 白光铺满）：没有这行，menu 只画一帧，白光永远出不来，
+  // 还会让「2 秒后再点」直接跳战斗。
+  const cinematicsRunning = portalTransitionAt >= 0;
+  if (cinematicsRunning || screen === 'game' || screen === 'upgrade' || screen === 'upgradeDetail' || screen === 'upgradeConfirm' || screen === 'paused' || screen === 'result') requestAnimationFrame(gameLoop);
   else loopRunning = false;
 }
 
@@ -3486,6 +4966,21 @@ function triggerMonsterSurge(count, label) {
   addShake(8, 0.3);
 }
 
+// 首领血量 = 玩家近期 DPS × bossFightSeconds，夹在 [bossBaseHealth×2, bossHealthMax]。
+// 目的：任何 build 的首领战都约十几秒 —— 既不会被高数值一刀秒（用户 2026-10-22 指出
+// 「首领和小怪一样被秒」），也不会因为敌人强化栈膨胀变成永远打不完的墙。
+function bossHealthTarget() {
+  // 用「整局平均 DPS」而不是瞬时 EMA：首领是这一局的高潮，要按这局的真实输出能力定血量。
+  // 瞬时值会被刚触发的怪物潮拉高，导致同 build 的首领战时长忽长忽短（实测 1 秒 / 90 秒两个极端）。
+  const elapsed = Math.max(1, game.elapsed || 0);
+  const averageDps = (game.damageDealtTotal || 0) / elapsed;
+  // 只用「整局平均」：近期 EMA 在爆发窗口会被拉到平均值的 8~9 倍（实测 daxia 平均 81 万/秒、
+  // EMA 708 万/秒），拿它定血会把首领做成打不完的墙。平均 DPS 更接近「这局的真实输出能力」。
+  const estimate = averageDps;
+  const target = estimate > 0 ? estimate * balance.bossFightSeconds : balance.bossBaseHealth * 3;
+  return Math.round(Math.min(balance.bossHealthMax, Math.max(balance.bossBaseHealth * 2, target)));
+}
+
 function spawnBoss() {
   const side = Math.floor(Math.random() * 4);
   let x = game.camera.x + width / 2;
@@ -3496,10 +4991,34 @@ function spawnBoss() {
   if (side === 3) x = game.camera.x - 30;
   x = Math.max(32, Math.min(game.worldWidth - 32, x));
   y = Math.max(90, Math.min(game.worldHeight - 32, y));
-  game.enemies.push(applyCurrentEnemyBuff({ x, y, type: 'boss', radius: 30, health: balance.bossBaseHealth, maxHealth: balance.bossBaseHealth, speed: 32, boss: true, experience: 0, facing: 1, specialTimer: 2.2, dashTimer: 0 }));
+  const health = bossHealthTarget();
+  // skipHealth：首领不吃金/红累积的血量强化（攻击/速度/重量仍然吃，保持压迫感）
+  game.enemies.push(applyCurrentEnemyBuff({
+    x, y, type: 'boss', radius: 30, health, maxHealth: health,
+    speed: 32, boss: true, experience: 0, facing: 1, specialTimer: 2.2, dashTimer: 0,
+  }, { skipHealth: true }));
   trackEnemySeen('boss');
 }
 
+// ---- 首领击退后的选择弹窗 -------------------------------------------------------------
+// 默认 endlessMode 开着，原来击杀首领直接进无尽，玩家没有「我赢了」的那一刻。
+// 现在先停下来问一句：结算拿奖励，还是继续挑战（进无尽）。
+function openBossChoice() {
+  game.bossChoice = { kills: game.kills, elapsed: game.elapsed };
+  screen = 'bossChoice';
+  playSound('levelup', 400, 60);
+}
+
+function bossChoicePanel() { return { x: 36, y: height * 0.30, width: width - 72, height: height * 0.34 }; }
+
+function bossChoiceBounds() {
+  const panel = bossChoicePanel();
+  const buttonWidth = (panel.width - 44) / 2;
+  return {
+    settle: { x: panel.x + 14, y: panel.y + panel.height - 62, width: buttonWidth, height: 46 },
+    endless: { x: panel.x + 30 + buttonWidth, y: panel.y + panel.height - 62, width: buttonWidth, height: 46 },
+  };
+}
 function startEndless() {
   game.endless = true;
   game.endlessStart = game.elapsed;
@@ -3561,7 +5080,7 @@ function startRandomEvent() {
   const choice = Math.floor(Math.random() * 3);
   if (choice === 0) {
     event.type = 'garden'; event.timer = 28; event.goal = 10;
-    game.plantNotice = { text: '随机事件：守护花圃，靠近地图标记', life: 3.5 };
+    game.plantNotice = { text: '随机事件：守护花圃，留意屏幕边缘', life: 3.5 };
   } else if (choice === 1) {
     event.type = 'harvest'; event.timer = 30; event.goal = 4;
     for (let index = 0; index < event.goal; index += 1) {
@@ -3593,7 +5112,7 @@ function applyRandomEventReward() {
     { label: '攻击力 +1', apply: () => { game.baseAttack += 1; } },
     { label: game.character === 'rabbit' ? '攻击距离 +60' : game.character === 'daxia' ? '刀光横向范围 +24' : game.character === 'xiaoxian' ? '伞的判定范围 +14' : '棍击距离 +12', apply: () => { if (game.character === 'rabbit') game.attackRange = Math.min(characterStatCaps.attackRange, game.attackRange + 60); else if (game.character === 'daxia') game.swordHalfWidth = Math.min(200, game.swordHalfWidth + 24); else if (game.character === 'xiaoxian') game.umbrellaRadius += 14; else game.stickHitHalfLength = Math.min(characterStatCaps.stickLength, game.stickHitHalfLength + 12); } },
     { label: game.character === 'rabbit' ? '手雷冷却 -1 秒' : game.character === 'daxia' ? '无极闪冷却 -2 秒' : game.character === 'xiaoxian' ? '伞回冷却 -2 秒' : '棍击速度 +15%', apply: () => { if (game.character === 'rabbit') game.grenadeCooldownMax = Math.max(5, game.grenadeCooldownMax - 1); else if (game.character === 'daxia') game.wuxianCooldownMax = Math.max(6, game.wuxianCooldownMax - 2); else if (game.character === 'xiaoxian') game.sanhuiCooldownMax = Math.max(5, game.sanhuiCooldownMax - 2); else game.attackSpeedMultiplier = Math.min(characterStatCaps.attackSpeedMultiplier, game.attackSpeedMultiplier + 0.15); } },
-    { label: game.character === 'rabbit' ? '子弹转向速度 +1.5' : game.character === 'daxia' ? '刀光推进速度 +30' : game.character === 'xiaoxian' ? '伞旋转伤害 +0.06' : '棍子旋转速度 +0.3', apply: () => { if (game.character === 'rabbit') game.projectileTurnRate += 1.5; else if (game.character === 'daxia') game.swordWaveSpeed += 30; else if (game.character === 'xiaoxian') game.umbrellaSpinRatio += 0.06; else game.orbitSpeed += 0.3; } },
+    { label: game.character === 'rabbit' ? '子弹射程 +12%' : game.character === 'daxia' ? '刀光推进速度 +30' : game.character === 'xiaoxian' ? '伞旋转伤害 +0.06' : '棍子旋转速度 +0.3', apply: () => { if (game.character === 'rabbit') game.bulletRangeBonus = Math.min(0.6, (game.bulletRangeBonus || 0) + 0.12); else if (game.character === 'daxia') game.swordWaveSpeed += 30; else if (game.character === 'xiaoxian') game.umbrellaSpinRatio += 0.06; else game.orbitSpeed += 0.3; } },
     { label: '移动速度 +12', apply: () => { game.moveSpeed = Math.min(characterStatCaps.moveSpeed, game.moveSpeed + 12); } },
     { label: '击退效果 +2', apply: () => { game.knockback += 2; } },
   ];
@@ -3669,6 +5188,20 @@ function separateEnemies() {
 }
 
 function updateGame(delta) {
+  // 瞄准：世界与玩家统一 0.1x（无上限）；进入瞄准用真实时间判定，不受时缓影响
+  if (game.character === 'supreme' || game.character === 'rabbit') {
+    const canAim = game.character === 'rabbit' ? game.grenadeCooldown <= 0 : skillReady();
+    if (skillTouchId !== null && !game.aimActive && Date.now() - (game.aimHoldStart || 0) >= balance.aimHoldMs && canAim) {
+      game.aimActive = true;
+      game.aimRawX = (game.aimRawX || 0);
+      if (game.character === 'rabbit') game.grenadeAimTarget = null;
+    }
+    if (game.aimActive) {
+      delta *= balance.aimSlowFactor;
+      if (game.character === 'rabbit') updateGrenadeAimTarget();
+      else updateAimTarget();
+    }
+  }
   game.moveSpeed = Math.min(characterStatCaps.moveSpeed, game.moveSpeed);
   game.attackRange = Math.min(characterStatCaps.attackRange, game.attackRange);
   game.grenadeRadius = Math.min(characterStatCaps.grenadeRadius, game.grenadeRadius);
@@ -3679,6 +5212,14 @@ function updateGame(delta) {
   game.fireInterval = Math.max(characterStatCaps.fireInterval, game.fireInterval);
   game.projectileSpeed = Math.min(gunCaps.projectileSpeed, game.projectileSpeed);
   game.elapsed += delta;
+  // 近期 DPS：每 0.5 秒算一次瞬时值，用 EMA 平滑。首领血量按它定，保证任何 build 的首领战时长接近。
+  game.dpsTimer = (game.dpsTimer || 0) + delta;
+  if (game.dpsTimer >= 0.5) {
+    const instant = (game.damageThisSecond || 0) / game.dpsTimer;
+    game.dpsEstimate = game.dpsEstimate > 0 ? game.dpsEstimate * 0.6 + instant * 0.4 : instant;
+    game.damageThisSecond = 0;
+    game.dpsTimer = 0;
+  }
   game.bossActive = game.enemies.some((enemy) => enemy.boss && enemy.health > 0);
   if (game.experience >= game.experienceNeeded && gainExperience(0)) return;
   const nextWave = game.endless
@@ -3694,11 +5235,46 @@ function updateGame(delta) {
     game.waveGoal = (nextWave < balance.finalWave || game.endless) ? balance.waveGoalBase + nextWave : 0;
     game.waveNotice = 2.4;
   }
+  const waveChanged = nextWave !== game.wave;
   game.wave = nextWave;
+  if (waveChanged && nextWave > 1) {
+    const buff = getEnemyBuffTotals();
+    game.hudToast = { text: `怪物强化 速+${fmtInt(buff.speed)} 伤+${fmtInt(buff.damage)} 血+${fmtInt(buff.health)} 累计+${fmtInt((buff.healthMultiplier - 1) * 100)}%`, life: 2.5 };
+  }
   game.waveNotice = Math.max(0, game.waveNotice - delta);
   game.spawnTimer -= delta;
   game.damageCooldown -= delta;
-  game.dashCooldown = Math.max(0, game.dashCooldown - delta);
+  if (game.character === 'supreme') {
+    // 充能回复：满格时暂停计时；每满一格 pulse 一次技能键
+    if ((game.dashCharges || 0) < (game.dashChargeMax || 2)) {
+      game.dashChargeTimer = (game.dashChargeTimer || 0) + delta;
+      if (game.dashChargeTimer >= game.dashRecharge) {
+        game.dashChargeTimer -= game.dashRecharge;
+        game.dashCharges = Math.min(game.dashChargeMax, (game.dashCharges || 0) + 1);
+        game.dashReadyAt = game.elapsed;
+        if (game.dashCharges >= game.dashChargeMax) game.dashChargeTimer = 0;
+      }
+    } else {
+      game.dashChargeTimer = 0;
+    }
+    // 棍阵成型：首次达到 6 根，冲刺充能上限 +1
+    if (!game.stickChargeBonusGranted && game.orbitStickCount >= balance.dashStickChargeThreshold) {
+      grantChargeSlot('sticks');
+    }
+  } else {
+    game.dashCooldown = Math.max(0, game.dashCooldown - delta);
+  }
+  game.dashInvulnTimer = Math.max(0, (game.dashInvulnTimer || 0) - delta);
+  game.rodMeterCooldown = Math.max(0, (game.rodMeterCooldown || 0) - delta);
+  game.dashSpinTimer = Math.max(0, (game.dashSpinTimer || 0) - delta);
+  if (game.dashRodTimer > 0) {
+    game.dashRodTimer = Math.max(0, game.dashRodTimer - delta);
+    if (game.dashRodTimer === 0) game.dashRodBonus = 0;
+  }
+  if (game.dashGhosts && game.dashGhosts.length) {
+    game.dashGhosts.forEach((ghost) => { ghost.life -= delta; });
+    game.dashGhosts = game.dashGhosts.filter((ghost) => ghost.life > 0);
+  }
   game.grenadeCooldown = Math.max(0, game.grenadeCooldown - delta);
   game.lightningCooldown = Math.max(0, game.lightningCooldown - delta);
   game.wuxianCooldown = Math.max(0, game.wuxianCooldown - delta);
@@ -3748,13 +5324,25 @@ function updateGame(delta) {
   if (game.input.x < -0.05) game.facing = -1;
   else if (game.input.x > 0.05) game.facing = 1;
   if (game.dashTimer > 0) {
-    player.x += game.dashX * moveSpeed * balance.dashSpeedFactor * delta;
-    player.y += game.dashY * moveSpeed * balance.dashSpeedFactor * delta;
+    game.dashGhostTimer = (game.dashGhostTimer || 0) - delta;
+    if (game.dashGhostTimer <= 0) {
+      game.dashGhostTimer = balance.dashGhostInterval;
+      if (!game.dashGhosts) game.dashGhosts = [];
+      game.dashGhosts.push({ x: player.x, y: player.y, facing: game.facing, life: balance.dashGhostLife });
+      while (game.dashGhosts.length > balance.dashGhostMax) game.dashGhosts.shift();
+    }
+    // 用「剩余冲刺时长」截断这一帧位移：否则最后一帧会多冲最多一帧，
+    // 实际距离与箭头长度对不上
+    const dashStep = Math.min(delta, game.dashTimer);
+    player.x += game.dashX * moveSpeed * balance.dashSpeedFactor * dashStep;
+    player.y += game.dashY * moveSpeed * balance.dashSpeedFactor * dashStep;
     game.dashTimer = Math.max(0, game.dashTimer - delta);
   } else {
     player.x += game.input.x * moveSpeed * delta;
     player.y += game.input.y * moveSpeed * delta;
   }
+  if (game.coachStep === 0 && (game.input.x || game.input.y)) game.coachMoved += moveSpeed * delta;
+  if (game.coachStep === 0 && game.coachMoved >= 60) game.coachStep = 1;
   player.x = Math.max(player.radius, Math.min(game.worldWidth - player.radius, player.x));
   player.y = Math.max(72 + player.radius, Math.min(game.worldHeight - player.radius, player.y));
   updateCamera();
@@ -3785,7 +5373,10 @@ function updateGame(delta) {
       let count = Math.min(8, game.projectileCount, room);
       if (game.alternateShotChance > 0 && Math.random() < game.alternateShotChance) count += 1;
       count = Math.max(0, Math.min(count, room));
-      const aimAngle = Math.atan2(target.enemy.y - player.y, target.enemy.x - player.x);
+      const lead = predictEnemyPoint(target.enemy, game.projectileSpeed);
+      const aimAngle = Math.atan2(lead.y - player.y, lead.x - player.x);
+      const range = game.attackRange * balance.bulletRangeRatio * (1 + (game.bulletRangeBonus || 0));
+      const bulletLife = range / Math.max(1, game.projectileSpeed);
       const scatter = game.weaponEvolution === 'scatter';
       for (let index = 0; index < count; index += 1) {
         const offset = (index - (count - 1) / 2) * 7;
@@ -3798,8 +5389,9 @@ function updateGame(delta) {
           y: player.y + Math.sin(aimAngle) * 24 + perpendicularY,
           vx: Math.cos(angle) * game.projectileSpeed,
           vy: Math.sin(angle) * game.projectileSpeed,
-          trajectory: 'track', damage: (game.baseAttack + game.bonusAttack + game.bulletDamage) * balance.rabbitBulletDamageScale,
+          trajectory: 'straight', damage: (game.baseAttack + game.bonusAttack + game.bulletDamage) * balance.rabbitBulletDamageScale,
           speed: game.projectileSpeed, piercesLeft: game.projectilePierce,
+          life: bulletLife,
           explosive: game.weaponEvolution === 'explosion', hitEnemies: [],
         });
       }
@@ -3811,40 +5403,22 @@ function updateGame(delta) {
         chainVolleyDue = game.chainVolleyCounter % balance.chainVolleyEvery === 0;
       }
     }
-    // Target assignment pass. Every bullet used to pick the lowest-HP enemy independently, so
-    // a whole volley converged on one victim while the rest of the horde walked in untouched.
-    // Bullets now claim targets in order, so a volley fans out across the crowd - and only
-    // fall back to doubling up once every reachable enemy is already claimed.
-    const claimed = new Set();
-    for (const bullet of game.bullets) {
-      if (bullet.fade !== undefined) { bullet.seekTarget = null; continue; }
-      bullet.seekTarget = chooseBulletTarget(bullet, claimed);
-      if (bullet.seekTarget) claimed.add(bullet.seekTarget);
-    }
+    // 直线弹道：发射时方向已固定，这里只前进，绝不转向
     for (const bullet of game.bullets) {
       bullet.previous = { x: bullet.x, y: bullet.y };
-      if (bullet.fade !== undefined) {
-        // Lost its target: coast on the last heading and fade, instead of blinking out.
-        bullet.fade -= delta;
-      } else {
-        const nextTarget = bullet.seekTarget ? { enemy: bullet.seekTarget } : null;
-        if (!nextTarget) {
-          bullet.fade = balance.bulletFadeTime;
-        } else {
-          const dx = nextTarget.enemy.x - bullet.x;
-          const dy = nextTarget.enemy.y - bullet.y;
-          const length = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-          const turn = Math.min(1, delta * game.projectileTurnRate);
-          bullet.vx += (dx / length * bullet.speed - bullet.vx) * turn;
-          bullet.vy += (dy / length * bullet.speed - bullet.vy) * turn;
-        }
-        bullet.life = (bullet.life === undefined ? balance.bulletLifetime : bullet.life - delta);
-      }
+      bullet.life -= delta;
       bullet.x += bullet.vx * delta;
       bullet.y += bullet.vy * delta;
-      if (bullet.x < -80 || bullet.y < -80 || bullet.x > game.worldWidth + 80 || bullet.y > game.worldHeight + 80) bullet.fade = 0;
+      if (bullet.x < -80 || bullet.y < -80 || bullet.x > game.worldWidth + 80 || bullet.y > game.worldHeight + 80) {
+        bullet.fade = 0;
+      } else if (bullet.life <= 0) {
+        bullet.fade = balance.bulletFadeTime;
+      }
+      if (bullet.fade !== undefined) bullet.fade -= delta;
     }
     game.bullets = game.bullets.filter((bullet) => bullet.life > 0 && (bullet.fade === undefined || bullet.fade > 0));
+    for (const bolt of (game.lightningBolts || [])) bolt.life -= delta;
+    game.lightningBolts = (game.lightningBolts || []).filter((bolt) => bolt.life > 0);
 
     if (game.radialShotCount > 0) {
       game.radialFireTimer -= delta;
@@ -3881,6 +5455,10 @@ function updateGame(delta) {
   if (game.character === 'daxia') updateDaxiaAttack(delta);
   if (game.character === 'xiaoxian') {
     updateUmbrellas(delta);
+    if (!game.umbrellaHintShown && game.umbrellas.some((umbrella) => umbrella.state !== 'held')) {
+      game.umbrellaHintShown = true;
+      game.hudToast = { text: '点击伞可提前收回', life: 2.5 };
+    }
     updateUmbrellaBurst(delta);
     updateThornCharge(delta);
   }
@@ -3892,8 +5470,14 @@ function updateGame(delta) {
     const dy = player.y - enemy.y;
     let distance = Math.sqrt(dx * dx + dy * dy);
     enemy.stagger = Math.max(0, (enemy.stagger || 0) - delta);
+    // 击退抗性衰减：不挨打就慢慢恢复（恢复后下一次击退又是正常力度）
+    enemy.knockbackGuard = Math.max(0, (enemy.knockbackGuard || 0) - balance.knockbackGuardDecay * delta);
     enemy.stun = Math.max(0, (enemy.stun || 0) - delta);
     enemy.stunFlash = Math.max(0, (enemy.stunFlash || 0) - delta);
+    if (enemy.armorBreakTimer > 0) {
+      enemy.armorBreakTimer = Math.max(0, enemy.armorBreakTimer - delta);
+      if (enemy.armorBreakTimer === 0) enemy.armorBreak = 0;
+    }
     const stopRange = enemyStopRange(enemy);
     if (Number.isFinite(enemy.knockbackTargetX) && Number.isFinite(enemy.knockbackTargetY)) {
       const pushX = enemy.knockbackTargetX - enemy.x;
@@ -3973,7 +5557,7 @@ function updateGame(delta) {
     enemy.x = Math.max(enemy.radius, Math.min(game.worldWidth - enemy.radius, enemy.x));
     enemy.y = Math.max(enemy.radius, Math.min(game.worldHeight - enemy.radius, enemy.y));
     distance = distanceBetween(enemy, player);
-    if (distance < player.radius + enemy.radius && game.damageCooldown <= 0 && game.dashTimer <= 0 && game.invulnTimer <= 0 && enemy.stun <= 0) {
+    if (distance < player.radius + enemy.radius && game.damageCooldown <= 0 && (game.dashTimer <= 0 && (game.dashInvulnTimer || 0) <= 0) && game.invulnTimer <= 0 && enemy.stun <= 0) {
       damagePlayer(enemy.damage || (enemy.boss ? 18 : 12), enemy);
       game.damageCooldown = balance.contactDamageCooldown;
       burstParticles(player.x, player.y - 10, '#f17a62', 7);
@@ -3997,12 +5581,26 @@ function updateGame(delta) {
     enemy.hitFlash = Math.max(0, (enemy.hitFlash || 0) - delta);
     enemy.dashHitCooldown = Math.max(0, (enemy.dashHitCooldown || 0) - delta);
     if (game.dashTimer > 0 && enemy.dashHitCooldown <= 0 && distanceBetween(enemy, player) < enemy.radius + player.radius + 12) {
-      const dashDamage = game.baseAttack + game.bonusAttack + 3 + game.orbitStickCount + game.dashBonusDamage;
-      applyAttackDamage(enemy, dashDamage);
-      knockbackEnemy(enemy, game.dashX, game.dashY);
+      // v2 棍影冲刺：伤害随棍阵成长 + 击退眩晕 + 棍势
+      const dashHitDamage = dashDamage();
+      applyAttackDamage(enemy, dashHitDamage);
+      knockbackEnemy(enemy, game.dashX * balance.dashKnockbackScale, game.dashY * balance.dashKnockbackScale);
       enemy.dashHitCooldown = 0.35;
       enemy.hitFlash = 0.16;
-      burstParticles(enemy.x, enemy.y, '#8fe6e9', 7);
+      const dashStunTime = enemy.boss ? balance.dashStun * balance.dashBossStunScale : balance.dashStun;
+      enemy.stun = Math.max(enemy.stun || 0, dashStunTime);
+      enemy.stunFlash = Math.max(enemy.stunFlash || 0, 0.3);
+      // 棍势：撞到人就让棍阵多一根（上限 +2，4 秒后归零）
+      if ((game.dashRodBonus || 0) < balance.dashStickBonusMax) game.dashRodBonus = (game.dashRodBonus || 0) + 1;
+      game.dashRodTimer = balance.dashStickBonusLife;
+      burstParticles(enemy.x, enemy.y, UI.dashCyan, 7);
+      // 每次冲刺只有「第一次命中」给顿帧与震屏，避免同屏多段命中打碎节奏
+      if (!game.dashFirstHit) {
+        game.dashFirstHit = true;
+        game.hitStop = Math.max(game.hitStop || 0, balance.dashHitStop);
+        addShake(balance.dashShakePower, balance.dashShakeTime);
+        burstParticles(enemy.x, enemy.y, UI.dashGold, 9);
+      }
       playSound('hit', 120);
     }
     if (!enemy.orbitCooldowns) enemy.orbitCooldowns = [];
@@ -4011,7 +5609,7 @@ function updateGame(delta) {
       for (let bulletIndex = game.bullets.length - 1; bulletIndex >= 0; bulletIndex -= 1) {
         const bullet = game.bullets[bulletIndex];
         const bulletDistance = bullet.previous ? distanceToSegment(enemy, bullet.previous, bullet) : distanceBetween(bullet, enemy);
-        if (!isEnemyVisible(enemy) || bullet.hitEnemies.includes(enemy) || bulletDistance > enemy.radius + 7) continue;
+        if (!isEnemyVisible(enemy) || bullet.hitEnemies.includes(enemy) || bulletDistance > enemy.radius + 7 + balance.bulletHitGrace) continue;
         const bulletDamage = applyAttackDamage(enemy, bullet.damage, bullet.explosive ? 'fire' : game.weaponEvolution === 'chain' ? 'lightning' : 'physical');
         hitDamage += bulletDamage;
         knockbackEnemy(enemy, bullet.vx, bullet.vy);
@@ -4029,7 +5627,10 @@ function updateGame(delta) {
           burstParticles(enemy.x, enemy.y, elementalDamageColors.fire, 14);
           bullet.piercesLeft = 0;
         } else if (game.weaponEvolution === 'chain') {
-          burstParticles(enemy.x, enemy.y, '#71e5ff', 8);
+          // 连锁弹：命中后向附近敌人放电，子弹本身消失（不再穿透飞行）
+          chainZapFrom(enemy, bullet.damage * 0.6);
+          bullet.piercesLeft = 0;
+          burstParticles(enemy.x, enemy.y, UI.dashCyan, 8);
         }
         burstParticles(bullet.x, bullet.y, '#ffe16b', 4);
         // 穿甲 (穿甲暴击弹): a critical bullet punches through extra enemies.
@@ -4061,15 +5662,40 @@ function updateGame(delta) {
       enemy.orbitCooldowns[stickIndex] = Math.max(0, (enemy.orbitCooldowns[stickIndex] || 0) - delta);
       if (enemy.orbitCooldowns[stickIndex] <= 0 && distanceToStick(enemy, sticks[stickIndex]) < enemy.radius + stickHeight / 2 + 4) {
         const damage = game.baseAttack + game.bonusAttack;
-        const stickDamage = applyAttackDamage(enemy, damage);
+        // 有效棍数：超出软上限后每根只按 60% 结算（画面仍是全部棍子）
+        const stickReal = Math.max(1, game.orbitStickCount + (game.dashRodBonus || 0));
+        const stickEffective = effectiveStickCount();
+        let stickHitDamage = damage * Math.min(1, stickEffective / stickReal);
+        // 三击下限：非首领单次棍击不超过最大生命 34%（主动技能不受此限）
+        if (!enemy.boss) stickHitDamage = Math.min(stickHitDamage, enemy.maxHealth * balance.normalHitHealthCap);
+        const stickDamage = applyAttackDamage(enemy, Math.max(1, stickHitDamage));
         hitDamage += stickDamage;
         knockbackEnemy(enemy, enemy.x - game.player.x, enemy.y - game.player.y);
+        // 棍意：棍击攒层（上限 3、0.5 秒冷却），冲刺时消耗
+        if ((game.rodMeter || 0) < 3 && (game.rodMeterCooldown || 0) <= 0) {
+          game.rodMeter = (game.rodMeter || 0) + 1;
+          game.rodMeterCooldown = 0.5;
+        }
+        // 棍阵共鸣：每 3 次棍击触发一次小范围冲击波
+        if (game.rodResonance) {
+          game.resonanceHits = (game.resonanceHits || 0) + 1;
+          if (game.resonanceHits >= 3) {
+            game.resonanceHits = 0;
+            const resonanceBase = Math.max(1, (game.baseAttack + game.bonusAttack) * 0.8);
+            for (const nearby of game.enemies) {
+              if (nearby === enemy || nearby.health <= 0) continue;
+              if (distanceBetween(nearby, enemy) > 40) continue;
+              applyAttackDamage(nearby, resonanceBase, 'physical');
+            }
+            burstParticles(enemy.x, enemy.y, UI.dashGold, 6);
+        }
+          }
         enemy.orbitCooldowns[stickIndex] = 0.22 / game.attackSpeedMultiplier;
         if (game.weaponEvolution === 'lightning' && game.lightningCooldown <= 0) {
           game.lightningCooldown = 0.7;
           for (const nearby of game.enemies) {
             if (nearby === enemy || distanceBetween(nearby, enemy) > 92) continue;
-            const lightningDamage = 3 + game.bonusAttack;
+            const lightningDamage = (3 + game.bonusAttack) * (game.lightningDamageMult || 1);
             applyAttackDamage(nearby, lightningDamage, 'lightning');
             knockbackEnemy(nearby, nearby.x - enemy.x, nearby.y - enemy.y);
           }
@@ -4110,9 +5736,12 @@ function updateGame(delta) {
         if (Math.random() < 0.3 && spawnPlantDrop(enemy.x, enemy.y, 'red-hidden', true)) {
           game.victoryPending = true;
           game.victoryTimer = 12;
-          game.plantNotice = { text: '隐藏植物出现！查看小地图高亮', life: 4 };
-        } else if (game.endless || balance.endlessMode) startEndless();
-        else finishGame(true);
+          game.plantNotice = { text: '隐藏植物出现！留意屏幕边缘', life: 4 };
+        } else if (game.endless) {
+          // 无尽模式里后续首领不再弹窗，否则每几分钟打断一次
+        } else {
+          openBossChoice();
+        }
         return;
       }
       burstParticles(enemy.x, enemy.y, '#f0b96b', 8);
@@ -4121,6 +5750,7 @@ function updateGame(delta) {
     }
   }
 
+  updateAmbient(delta);
   updateRandomEvent(delta);
   if (updatePlantDrops(delta)) return;
   if (game.victoryPending) {
@@ -4131,14 +5761,17 @@ function updateGame(delta) {
 
   if (game.health <= 0) {
     game.health = 0;
+    game.deathCause = describeDeath(game.lastHit);
     finishGame(false);
   }
 }
 
 function getOrbitSticks() {
   const sticks = [];
-  for (let index = 0; index < game.orbitStickCount; index += 1) {
-    const angle = game.elapsed * game.orbitSpeed + index * Math.PI * 2 / game.orbitStickCount;
+  const total = game.orbitStickCount + (game.dashRodBonus || 0);
+  for (let index = 0; index < total; index += 1) {
+    const spinBonus = (game.dashSpinTimer || 0) > 0 ? 1 + (game.dashSpinBonus || 0) : 1;
+    const angle = game.elapsed * game.orbitSpeed * spinBonus + index * Math.PI * 2 / total;
     sticks.push({
       x: game.player.x + Math.cos(angle) * game.orbitRadius,
       y: game.player.y + Math.sin(angle) * game.orbitRadius,
@@ -4182,7 +5815,7 @@ const evolutionTable = {
   rabbit: [
     { title: '武器进化：散射弹', description: '子弹改为扇形齐射，攻击范围更广', ready: (g) => g.projectileCount >= 2, apply: () => { game.weaponEvolution = 'scatter'; game.projectileCount = Math.max(3, game.projectileCount); } },
     { title: '武器进化：爆裂弹', description: '命中后爆炸，对周围敌人造成伤害', ready: (g) => g.bulletDamage >= 2, apply: () => { game.weaponEvolution = 'explosion'; game.bulletDamage += 2; } },
-    { title: '武器进化：连锁弹', description: '子弹穿透并跳向其他敌人', ready: (g) => g.projectilePierce >= 1, apply: () => { game.weaponEvolution = 'chain'; game.projectilePierce = Math.max(2, game.projectilePierce); } },
+    { title: '武器进化：连锁弹', description: '子弹命中后向附近敌人放电（60% 伤害）', ready: (g) => g.projectilePierce >= 1, apply: () => { game.weaponEvolution = 'chain'; game.projectilePierce = Math.max(2, game.projectilePierce); } },
   ],
   daxia: [
     { title: '武器进化：三途刀', description: '每次出刀三道刀光齐发，穿透衰减放宽为 70% / 40%；并直接 +2 刀光数（更快走向无极剑阵 / 寂）', ready: (g) => g.swordWaveCount >= 2, apply: () => { game.weaponEvolution = 'threefold'; game.swordWaveCount += 2; } },
@@ -4286,33 +5919,83 @@ function chooseUpgrades() {
     }
     if (!takeRandom(rarity)) break;
   }
+  // 输出保底：连续 3 级没拿到输出卡，这一级至少给一张（不改变稀有度期望，只防脸黑）
+  if ((game.offenseDrought || 0) >= balance.offenseDroughtMax && !chosen.some((upgrade) => upgrade.offense)) {
+    const offensePool = pool.filter((upgrade) => upgrade.offense);
+    if (offensePool.length) {
+      const forced = offensePool[Math.floor(Math.random() * offensePool.length)];
+      if (chosen.length >= 4) chosen[chosen.length - 1] = forced;
+      else chosen.push(forced);
+      pool.splice(pool.indexOf(forced), 1);
+    }
+  }
   return chosen;
 }
 
+// 战斗地面：贴图平铺（384px 一块，按格子 hash 随机翻转，抵消重复感）
+// 装饰层每 2 块叠一次，装饰件每 3 块放一个；贴图没加载完时退回纯色格子。
+function groundHash(column, row) {
+  // 用 Math.imul 做 32 位整数混���：普通乘法会丢精度，hash 会挤在低区（翻转看起来一样）
+  let h = (Math.imul(column, 374761393) + Math.imul(row, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
 function drawGameBackground() {
-  const tileSize = 150;
+  const tileSize = 384;
   const centerX = game.camera.x + width / 2;
   const centerY = game.camera.y + height / 2;
-  const firstColumn = Math.floor((centerX - width / (2 * gameWorldZoom)) / tileSize);
-  const lastColumn = Math.ceil((centerX + width / (2 * gameWorldZoom)) / tileSize);
-  const firstRow = Math.floor((centerY - height / (2 * gameWorldZoom)) / tileSize);
-  const lastRow = Math.ceil((centerY + height / (2 * gameWorldZoom)) / tileSize);
+  const firstColumn = Math.floor((centerX - width / (2 * gameWorldZoom)) / tileSize) - 1;
+  const lastColumn = Math.ceil((centerX + width / (2 * gameWorldZoom)) / tileSize) + 1;
+  const firstRow = Math.floor((centerY - height / (2 * gameWorldZoom)) / tileSize) - 1;
+  const lastRow = Math.ceil((centerY + height / (2 * gameWorldZoom)) / tileSize) + 1;
   context.fillStyle = '#a8cf79';
   context.fillRect(0, 0, width, height);
-  const shades = ['#a8cf79', '#a3ca73', '#afd27e', '#9fc66f'];
+
   for (let row = firstRow; row <= lastRow; row += 1) {
     for (let column = firstColumn; column <= lastColumn; column += 1) {
-      const shadeIndex = Math.abs((row * 7 + column * 13) % shades.length);
       const tileX = column * tileSize - game.camera.x;
       const tileY = row * tileSize - game.camera.y;
-      context.fillStyle = shades[shadeIndex];
-      context.fillRect(tileX, tileY, tileSize, tileSize);
-      context.fillStyle = 'rgba(245, 255, 206, 0.28)';
-      context.fillRect(tileX + 24, tileY + 35, 3, 10);
-      context.fillRect(tileX + 102, tileY + 112, 3, 9);
-      context.fillStyle = 'rgba(61, 116, 53, 0.2)';
-      context.fillRect(tileX + 70, tileY + 55, 3, 12);
-      context.fillRect(tileX + 126, tileY + 24, 3, 8);
+      if (!groundReady) {
+        // 素材没加载完（或加载失败）时的兜底：保留原来的纯色格子
+        const shades = ['#a8cf79', '#a3ca73', '#afd27e', '#9fc66f'];
+        context.fillStyle = shades[Math.abs((row * 7 + column * 13) % shades.length)];
+        context.fillRect(tileX, tileY, tileSize, tileSize);
+        continue;
+      }
+      // 每块按 hash 翻转 / 旋转 90 度，同一张贴图也能拼出变化
+      const flip = Math.floor(groundHash(column, row) * 4);
+      context.save();
+      context.translate(tileX + tileSize / 2, tileY + tileSize / 2);
+      if (flip === 1) context.scale(-1, 1);
+      else if (flip === 2) context.scale(1, -1);
+      else if (flip === 3) context.rotate(Math.PI / 2);
+      context.drawImage(groundSprite, -tileSize / 2, -tileSize / 2, tileSize, tileSize);
+      context.restore();
+      if (groundDetailReady && ((row + column) & 1) === 0) {
+        context.save();
+        context.translate(tileX + tileSize / 2, tileY + tileSize / 2);
+        if (groundHash(row, column) > 0.5) context.scale(-1, 1);
+        context.globalAlpha = 0.85;
+        context.drawImage(groundDetailSprite, -tileSize / 2, -tileSize / 2, tileSize, tileSize);
+        context.restore();
+      }
+      // 装饰件：每 3 格一个，按 hash 选种类、大小与偏移
+      if ((row * 7 + column * 11) % 3 === 0) {
+        const kinds = ['flowers', 'stones', 'fence', 'puddle'];
+        const kind = kinds[Math.floor(groundHash(column * 3, row * 5) * 4)];
+        if (decorReady[kind]) {
+          const size = 96 + Math.floor(groundHash(row, column * 2) * 56);
+          const offsetX = (groundHash(column, row * 3) - 0.5) * tileSize * 0.55;
+          const offsetY = (groundHash(row * 2, column) - 0.5) * tileSize * 0.55;
+          context.save();
+          context.translate(tileX + tileSize / 2 + offsetX, tileY + tileSize / 2 + offsetY);
+          if (groundHash(column * 5, row) > 0.5) context.scale(-1, 1);
+          context.globalAlpha = 0.92;
+          context.drawImage(decorSprites[kind], -size / 2, -size / 2, size, size);
+          context.restore();
+        }
+      }
     }
   }
 }
@@ -4391,6 +6074,37 @@ function drawLandmark(landmark) {
   }
 }
 
+// 战斗 HUD 右侧那一行：等级 + 当前武器状态，最多 101px 宽（可用 141.8px，见设计报告 §4.1）。
+// 攻击力/击退/伞在手中 这类长文案留给角色面板，HUD 只放战斗中会变的那一个数。
+// 首领倒计时：这游戏的「一局」终点是 150 秒的首领战，但原来玩家完全不知道还有多久。
+// 把它做成暂停键右边的常驻小牌：首领前是倒计时，登场后变成状态。
+function bossCountdownLabel() {
+  if (game.bossSpawned) return game.bossActive ? '首领战中' : '首领已登场';
+  const left = Math.max(0, bossSpawnTime - game.elapsed);
+  return `首领 ${fmtCeil(left)} 秒`;
+}
+
+// 战斗 HUD 第二行：波次/击杀/首领倒计时合并成一句，省掉独立浮块
+function battleWaveLabel() {
+  if (game.endless) return `无尽 ${fmtInt(game.elapsed - (game.endlessStart || 0))} 秒 · 击杀 ${fmtInt(game.waveKills)}`;
+  if (game.bossSpawned) return `首领战 · 击杀 ${fmtInt(game.waveKills)}`;
+  return `波 ${fmtInt(game.wave)} · 击杀 ${fmtInt(game.waveKills)}/${fmtInt(game.waveGoal)} · ${bossCountdownLabel()}`;
+}
+
+
+function compactStatLine() {
+  const level = `Lv.${fmtInt(game.level)}`;
+  if (game.character === 'rabbit') return `${level} · 弹 ${fmtInt(game.projectileCount)}`;
+  if (game.character === 'daxia') {
+    const mode = swordWaveMode();
+    if (mode === 'ji') return `${level} · 寂 +${fmtInt((game.swordJiScale - 1) * 100)}%`;
+    if (mode === 'formation') return `${level} · 剑阵 ${fmtInt(game.swordWaveCount)}`;
+    return `${level} · 刀 ${fmtInt(game.swordWaveCount)}`;
+  }
+  if (game.character === 'xiaoxian') return `${level} · ${hasUmbrella() ? '伞在手' : '玉衣'}`;
+  return `${level} · 棍 ${fmtInt(game.orbitStickCount)}`;
+}
+
 function drawBar(x, y, barWidth, barHeight, value, maxValue, color) {
   context.fillStyle = 'rgba(31, 57, 35, 0.28)';
   roundedRect(x, y, barWidth, barHeight, barHeight / 2);
@@ -4401,36 +6115,409 @@ function drawBar(x, y, barWidth, barHeight, value, maxValue, color) {
   }
 }
 
-function drawMiniMap() {
-  const miniHeight = Math.min(150, height * 0.22);
-  const ratio = game.worldWidth / game.worldHeight;
-  const miniWidth = Math.min(120, miniHeight * ratio);
-  const x = width - miniWidth - 12; const y = 112;
-  context.fillStyle = 'rgba(37, 62, 39, 0.84)'; context.beginPath();
-  if (context.roundRect) context.roundRect(x, y, miniWidth, miniHeight, 9); else context.rect(x, y, miniWidth, miniHeight);
-  context.fill(); context.save(); context.beginPath();
-  if (context.roundRect) context.roundRect(x + 3, y + 3, miniWidth - 6, miniHeight - 6, 7); else context.rect(x + 3, y + 3, miniWidth - 6, miniHeight - 6);
-  context.clip(); context.fillStyle = '#87ae66'; context.fillRect(x + 3, y + 3, miniWidth - 6, miniHeight - 6);
-  const px = (worldX, worldY) => ({ x: x + 3 + worldX / game.worldWidth * (miniWidth - 6), y: y + 3 + worldY / game.worldHeight * (miniHeight - 6) });
-  for (const decoration of game.gardenDecorations) {
-    const p = px(decoration.x, decoration.y); context.fillStyle = '#d5c083'; context.fillRect(p.x - 1.4, p.y - 1.4, 3, 3);
+// ---- 时段氛围（D8 技术美术方案 v1 的核心手法）------------------------------------------
+// 一张背景 + 叠色 = 四个时段，0 新增场景字节。写实背景上线后 alpha 要再压低（见 reports/色彩/07-写实背景方案.md）。
+const TIME_PHASES = [
+  { name: '清晨', tint: [110, 190, 215], alpha: 0.10, extra: [255, 226, 214], extraAlpha: 0.05, particle: 'petal', rate: 3.2 },
+  { name: '正午', tint: [255, 240, 150], alpha: 0.06, extra: null, extraAlpha: 0, particle: 'dust', rate: 2.6 },
+  { name: '黄昏', tint: [255, 150, 90], alpha: 0.12, extra: [255, 200, 150], extraAlpha: 0.06, particle: 'leaf', rate: 3.0 },
+  { name: '夜晚', tint: [45, 55, 155], alpha: 0.22, extra: [24, 18, 60], extraAlpha: 0.10, particle: 'firefly', rate: 1.4 },
+];
+
+function timePhaseIndex() {
+  const elapsed = game ? game.elapsed : 0;
+  if (elapsed < balance.timePhaseSeconds[0]) return 0;
+  if (elapsed < balance.timePhaseSeconds[1]) return 1;
+  if (elapsed < balance.timePhaseSeconds[2]) return 2;
+  return 3;
+}
+
+function timePhase() { return TIME_PHASES[timePhaseIndex()]; }
+
+// 氛围粒子：屏幕范围内的世界坐标，按当前时段选贴图；数量有上限（性能与可读性）。
+function spawnAmbient(kind) {
+  if (!game || game.ambient.length >= balance.ambientCap) return;
+  const fall = kind === 'leaf' || kind === 'petal';
+  game.ambient.push({
+    kind,
+    x: game.camera.x + Math.random() * width,
+    y: game.camera.y - 24 - Math.random() * 40,
+    vx: (Math.random() - 0.5) * (fall ? 34 : 12),
+    vy: fall ? 26 + Math.random() * 26 : -6 - Math.random() * 10,
+    rot: Math.random() * Math.PI * 2,
+    spin: (Math.random() - 0.5) * (fall ? 2.2 : 0.8),
+    scale: 0.7 + Math.random() * 0.6,
+    life: 6 + Math.random() * 6,
+    maxLife: 12,
+  });
+}
+
+function updateAmbient(delta) {
+  if (!game) return;
+  const phase = timePhase();
+  game.ambientTimer -= delta;
+  if (game.ambientTimer <= 0) {
+    game.ambientTimer = phase.rate > 0 ? 1 / phase.rate : 1;
+    spawnAmbient(phase.particle);
   }
-  if (game.event) {
-    const p = px(game.event.x, game.event.y); context.fillStyle = '#ff6d58'; context.beginPath(); context.arc(p.x, p.y, 4, 0, Math.PI * 2); context.fill();
-    context.strokeStyle = '#fff0a8'; context.lineWidth = 1.5; context.beginPath(); context.arc(p.x, p.y, 7 + Math.sin(game.elapsed * 6) * 2, 0, Math.PI * 2); context.stroke();
-    for (const item of game.event.items) { const point = px(item.x, item.y); context.fillStyle = '#ffe26d'; context.fillRect(point.x - 1.5, point.y - 1.5, 3, 3); }
+  for (const item of game.ambient) {
+    item.x += item.vx * delta;
+    item.y += item.vy * delta;
+    item.rot += item.spin * delta;
+    item.life -= delta;
   }
-  for (const drop of game.plants) {
-    const p = px(drop.x, drop.y); const plant = plantCatalog.find((item) => item.id === drop.id);
-    const pulse = 2.5 + (Math.sin(game.elapsed * 5 + drop.phase) + 1) * 2.5;
-    context.strokeStyle = plantColors[plant.rarity]; context.lineWidth = 1.5; context.beginPath(); context.arc(p.x, p.y, pulse, 0, Math.PI * 2); context.stroke();
-    context.fillStyle = '#fff8ce'; context.beginPath(); context.arc(p.x, p.y, 2.1, 0, Math.PI * 2); context.fill();
+  game.ambient = game.ambient.filter((item) => item.life > 0);
+}
+
+function drawAmbient() {
+  if (!game || !game.ambient.length) return;
+  for (const item of game.ambient) {
+    const sprite = ambientSprites[item.kind];
+    if (!sprite || !ambientReady[item.kind]) continue;
+    const x = item.x - game.camera.x;
+    const y = item.y - game.camera.y;
+    if (x < -40 || y < -40 || x > width + 40 || y > height + 40) continue;
+    const fade = Math.min(1, item.life / 1.5);
+    const lit = item.kind === 'firefly' || item.kind === 'dust';
+    context.save();
+    context.globalAlpha = fade * (lit ? 0.95 : 0.92);
+    if (lit) context.globalCompositeOperation = 'lighter';
+    context.translate(x, y);
+    context.rotate(item.rot);
+    const size = (lit ? 22 : 34) * item.scale;
+    context.drawImage(sprite, -size / 2, -size / 2, size, size);
+    context.restore();
   }
-  const player = px(game.player.x, game.player.y); context.fillStyle = '#fff'; context.beginPath(); context.arc(player.x, player.y, 3.2, 0, Math.PI * 2); context.fill();
-  context.restore(); context.strokeStyle = '#fff2c8'; context.lineWidth = 1.5; context.beginPath();
-  if (context.roundRect) context.roundRect(x, y, miniWidth, miniHeight, 9); else context.rect(x, y, miniWidth, miniHeight);
-  context.stroke(); context.textAlign = 'center'; context.fillStyle = '#fff7d9'; context.font = 'bold 10px sans-serif';
-  context.fillText(`地图 · 宝物 ${game.plants.length}`, x + miniWidth / 2, y + miniHeight - 5);
+  context.globalCompositeOperation = 'source-over';
+}
+
+// 时段叠色：全屏一层，写在世界背景之上、实体之下
+// 颜色插值：两个时段的 tint/alpha 线性过渡，避免到点「啪」一下换天色。
+function lerpRgb(from, to, t) {
+  if (!from) return to;
+  if (!to) return from;
+  return [
+    Math.round(from[0] + (to[0] - from[0]) * t),
+    Math.round(from[1] + (to[1] - from[1]) * t),
+    Math.round(from[2] + (to[2] - from[2]) * t),
+  ];
+}
+
+// 当前实际生效的时段色（切换窗口内是前后两段的插值结果）
+function currentTint() {
+  const seconds = balance.timePhaseSeconds;
+  const blend = Math.max(0.01, balance.timeTransitionSeconds || 5);
+  const elapsed = game ? game.elapsed : 0;
+  let index = 0;
+  for (let i = 0; i < seconds.length; i += 1) if (elapsed >= seconds[i]) index = i + 1;
+  const phaseStart = index === 0 ? 0 : seconds[index - 1];
+  const into = elapsed - phaseStart;
+  if (index > 0 && into < blend) {
+    const t = Math.max(0, Math.min(1, into / blend));
+    const from = TIME_PHASES[index - 1];
+    const to = TIME_PHASES[index];
+    return {
+      tint: lerpRgb(from.tint, to.tint, t),
+      alpha: from.alpha + (to.alpha - from.alpha) * t,
+      extra: lerpRgb(from.extra, to.extra, t),
+      extraAlpha: from.extraAlpha + (to.extraAlpha - from.extraAlpha) * t,
+    };
+  }
+  const phase = TIME_PHASES[index];
+  return { tint: phase.tint, alpha: phase.alpha, extra: phase.extra, extraAlpha: phase.extraAlpha };
+}
+
+function drawTimeTint() {
+  const tint = currentTint();
+  // 这里在 drawGame 的世界变换里：坐标已经是「屏幕系」（其他绘制都手动减了 camera），
+  // 但外面还套着 gameWorldZoom 的缩放（以屏幕中心为轴）。所以不能画 (0,0,width,height)：
+  // 缩放 < 1 时四边会露出来 —— 这就是「图层没铺满屏幕」。
+  // 解法：以中心为准铺 3 倍大小，任何方向缩放都盖住（zoom ≥ 1/3 即安全）。
+  const padW = width * 3;
+  const padH = height * 3;
+  const originX = -width;
+  const originY = -height;
+  context.save();
+  // 用 globalAlpha + rgb() 而不是每次拼 rgba()：可读性一样，且 A7.4 只统计字面量色值。
+  context.globalAlpha = tint.alpha;
+  context.fillStyle = 'rgb(' + tint.tint[0] + ',' + tint.tint[1] + ',' + tint.tint[2] + ')';
+  context.fillRect(originX, originY, padW, padH);
+  if (tint.extra && tint.extraAlpha > 0.001) {
+    context.globalAlpha = tint.extraAlpha;
+    context.fillStyle = 'rgb(' + tint.extra[0] + ',' + tint.extra[1] + ',' + tint.extra[2] + ')';
+    context.fillRect(originX, originY, padW, padH);
+  }
+  context.restore();
+}
+// 边缘提示：植物/事件在屏幕外时，在屏幕边缘画小箭头（替代小地图）
+function drawEdgeIndicators() {
+  const margin = 24;
+  const topLimit = viewInsets.top + HUD_TOP_GAP + 80;
+  const bottomLimit = height - viewInsets.bottom - 40;
+  const center = worldToScreen(game.player.x, game.player.y);
+  const items = [];
+  for (const plant of game.plants) {
+    const plantDef = plantCatalog.find((item) => item.id === plant.id);
+    if (!plantDef) continue;
+    items.push({ x: plant.x, y: plant.y, color: plantColors[plantDef.rarity], pulse: plant.phase });
+  }
+  if (game.event) items.push({ x: game.event.x, y: game.event.y, color: UI.danger, pulse: 0 });
+  const onScreen = (point) => point.x >= margin && point.x <= width - margin && point.y >= topLimit && point.y <= bottomLimit;
+  const offscreen = items
+    .map((item) => {
+      const screenPoint = worldToScreen(item.x, item.y);
+      const distance = Math.hypot(item.x - game.player.x, item.y - game.player.y);
+      return { ...item, screenPoint, distance };
+    })
+    .filter((item) => !onScreen(item.screenPoint))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 4);
+  for (const item of offscreen) {
+    const dx = item.screenPoint.x - center.x;
+    const dy = item.screenPoint.y - center.y;
+    const angle = Math.atan2(dy, dx);
+    // 把方向投到安全矩形上，得到边缘落点
+    const halfW = width / 2 - margin;
+    const halfH = (bottomLimit - topLimit) / 2;
+    const midY = topLimit + halfH;
+    const scale = Math.min(
+      Math.abs(dx) > 1e-6 ? halfW / Math.abs(dx) : Infinity,
+      Math.abs(dy) > 1e-6 ? halfH / Math.abs(dy) : Infinity,
+    );
+    const px = width / 2 + dx * scale;
+    const py = midY + dy * scale;
+    const pulse = 1 + Math.sin(game.elapsed * 5 + (item.pulse || 0)) * 0.12;
+    context.save();
+    context.globalAlpha = 0.9;
+    context.translate(px, py);
+    context.rotate(angle);
+    context.fillStyle = item.color;
+    context.beginPath();
+    context.moveTo(9 * pulse, 0);
+    context.lineTo(-5, 6 * pulse);
+    context.lineTo(-5, -6 * pulse);
+    context.closePath();
+    context.fill();
+    context.restore();
+    context.fillStyle = item.color;
+    context.beginPath();
+    context.arc(px, py, 2.5, 0, Math.PI * 2);
+    context.fill();
+  }
+}
+
+// 瞄准态：0.1x 时缓覆盖层 + 准星 + 锁定标记（画在世界之上、HUD 之下）
+// 手雷瞄准覆盖层：抛物线 + 落点圈 + 锁定 + 时缓标
+function drawGrenadeAimOverlay() {
+  context.fillStyle = UI.aimDim;
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = UI.aimEdge;
+  context.fillRect(0, 0, width, height * 0.12);
+  context.fillRect(0, height * 0.88, width, height * 0.12);
+
+  const landing = grenadeLandingPoint();
+  const playerScreen = worldToScreen(game.player.x, game.player.y);
+  const landingScreen = worldToScreen(landing.x, landing.y);
+  const distance = Math.hypot(landing.x - game.player.x, landing.y - game.player.y);
+  const arcHeight = 70 + distance * 0.16;
+
+  // 抛物线预览（与飞行同一公式）
+  const lineColor = game.grenadeAimOverdrag ? UI.danger : landing.locked ? UI.aimGold : UI.aimCream;
+  context.strokeStyle = lineColor;
+  context.lineWidth = 3;
+  context.globalAlpha = 0.75;
+  context.beginPath();
+  for (let step = 0; step <= 24; step += 1) {
+    const k = step / 24;
+    const x = playerScreen.x + (landingScreen.x - playerScreen.x) * k;
+    const y = playerScreen.y + (landingScreen.y - playerScreen.y) * k - Math.sin(k * Math.PI) * arcHeight * gameWorldZoom;
+    if (step === 0) context.moveTo(x, y); else context.lineTo(x, y);
+  }
+  context.stroke();
+  context.globalAlpha = 1;
+
+  // 落点圈：外圈 = 爆炸范围
+  const radius = Math.max(18, game.grenadeRadius * gameWorldZoom);
+  context.strokeStyle = lineColor;
+  context.lineWidth = 2.5;
+  context.beginPath();
+  context.arc(landingScreen.x, landingScreen.y, radius, 0, Math.PI * 2);
+  context.stroke();
+  context.globalAlpha = 0.35;
+  context.fillStyle = lineColor;
+  context.beginPath();
+  context.arc(landingScreen.x, landingScreen.y, radius * 0.45, 0, Math.PI * 2);
+  context.fill();
+  context.globalAlpha = 1;
+  context.fillStyle = lineColor;
+  context.beginPath();
+  context.arc(landingScreen.x, landingScreen.y, 3, 0, Math.PI * 2);
+  context.fill();
+
+  // 锁定敌人：画金色环 + 文字
+  if (landing.locked && game.grenadeAimTarget) {
+    const targetScreen = enemyVisualCenter(game.grenadeAimTarget);
+    context.strokeStyle = UI.aimGold;
+    context.lineWidth = 2.5;
+    context.beginPath();
+    context.arc(targetScreen.x, targetScreen.y, enemyLockRadius(game.grenadeAimTarget), 0, Math.PI * 2);
+    context.stroke();
+    context.fillStyle = UI.aimGold;
+    context.font = 'bold 10px sans-serif';
+    context.textAlign = 'center';
+    context.fillText('锁定', targetScreen.x, targetScreen.y - enemyLockRadius(game.grenadeAimTarget) - 8);
+  }
+
+  // 超距取消提示
+  if (game.grenadeAimOverdrag) {
+    context.fillStyle = UI.scrim;
+    roundedRect(landingScreen.x - 62, landingScreen.y - radius - 40, 124, 26, 9);
+    context.fillStyle = UI.cream;
+    context.font = 'bold 11px sans-serif';
+    context.textAlign = 'center';
+    context.fillText('超出距离 · 松手取消', landingScreen.x, landingScreen.y - radius - 22);
+  }
+
+  // 时缓标
+  context.fillStyle = UI.aimBadge;
+  roundedRect(20, viewInsets.top + 20, 96, 28, 10);
+  context.fillStyle = UI.aimLabel;
+  context.font = 'bold 13px sans-serif';
+  context.textAlign = 'center';
+  context.fillText('时缓 0.1x', 68, viewInsets.top + 39);
+}
+
+function drawAimOverlay() {
+  if (!game || !game.aimActive) return;
+  if (game.character === 'rabbit') { drawGrenadeAimOverlay(); return; }
+  // 去饱和：半透明灰 + 上下暗角（两次 fill，成本远低于 canvas filter）
+  context.fillStyle = UI.aimDim;
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = UI.aimEdge;
+  context.fillRect(0, 0, width, height * 0.12);
+  context.fillRect(0, height * 0.88, width, height * 0.12);
+
+  // 箭头：从角色身上伸出，指向瞄准方向/锁定目标
+  const arrow = aimArrowGeometry();
+  const arrowColor = arrow.target ? UI.aimGold : UI.aimCream;
+  context.strokeStyle = arrowColor;
+  context.lineCap = 'round';
+  // 外发光（粗半透明）
+  context.globalAlpha = 0.28;
+  context.lineWidth = 12;
+  context.beginPath();
+  context.moveTo(arrow.startX, arrow.startY);
+  context.lineTo(arrow.endX, arrow.endY);
+  context.stroke();
+  context.globalAlpha = 1;
+  // 箭杆
+  context.lineWidth = 5;
+  context.beginPath();
+  context.moveTo(arrow.startX, arrow.startY);
+  context.lineTo(arrow.endX, arrow.endY);
+  context.stroke();
+
+  // 箭头（三角形）
+  const angle = Math.atan2(arrow.dirY, arrow.dirX);
+  const headLength = 16;
+  const headWidth = 13;
+  context.fillStyle = arrowColor;
+  context.beginPath();
+  context.moveTo(arrow.endX, arrow.endY);
+  context.lineTo(arrow.endX - Math.cos(angle - 0.42) * headLength, arrow.endY - Math.sin(angle - 0.42) * headLength);
+  context.lineTo(arrow.endX - Math.cos(angle + 0.42) * headLength, arrow.endY - Math.sin(angle + 0.42) * headLength);
+  context.closePath();
+  context.fill();
+  context.lineWidth = headWidth * 0.12;
+
+  // 起点小圆：明确「从角色身上伸出」
+  context.fillStyle = arrowColor;
+  context.beginPath();
+  context.arc(arrow.startX, arrow.startY, 3.5, 0, Math.PI * 2);
+  context.fill();
+
+  // 锁定标记：目标外圈 + 「锁定」
+  if (arrow.target) {
+    const targetCenter = enemyVisualCenter(arrow.target);
+    const targetX = targetCenter.x;
+    const targetY = targetCenter.y;
+    const radius = enemyLockRadius(arrow.target);
+    context.strokeStyle = arrowColor;
+    context.lineWidth = 2.5;
+    context.beginPath();
+    context.arc(targetX, targetY, radius, 0, Math.PI * 2);
+    context.stroke();
+    context.fillStyle = UI.aimGold;
+    context.font = 'bold 10px sans-serif';
+    context.textAlign = 'center';
+    context.fillText('锁定', targetX, targetY - radius - 8);
+  }
+
+  // 时缓标（左上，HUD 下面一层，但能读到）
+  context.fillStyle = UI.aimBadge;
+  roundedRect(16, viewInsets.top + 96, 104, 26, 9);
+  context.fillStyle = UI.aimLabel;
+  context.font = 'bold 12px sans-serif';
+  context.textAlign = 'left';
+  context.fillText('时缓 0.1x', 26, viewInsets.top + 114);
+
+  // 超距：松手取消（红色提示，不画取消按钮）
+  if (game.aimOverdrag) {
+    const tipX = arrow.endX;
+    const tipY = arrow.endY - 26;
+    context.fillStyle = 'rgba(120, 30, 24, 0.85)';
+    roundedRect(tipX - 62, tipY - 14, 124, 26, 9);
+    context.fillStyle = '#ffe3d6';
+    context.font = 'bold 11px sans-serif';
+    context.textAlign = 'center';
+    context.fillText('超出距离 · 松手取消', tipX, tipY + 4);
+  }
+}
+
+
+// 瞄准箭头几何：从角色身上伸出，指向准星或锁定目标（终点停在目标边缘）
+// 敌人的视觉中心：精灵按「脚下坐标 - 身高×0.32」绘制，锁定环必须跟精灵中心，
+// 否则圈会落在怪物脚下（用户：准星要以怪物为中心，不要偏移）。
+// 世界坐标 → 屏幕坐标：战斗世界以 gameWorldZoom(0.82) 围绕屏幕中心缩放绘制，
+// 叠加震动。锁定环/箭头只要漏掉这一步，就会朝屏幕外侧偏 18%。
+function worldToScreen(worldX, worldY) {
+  const shake = shakeOffset();
+  return {
+    x: width / 2 + shake.x + ((worldX - game.camera.x) - width / 2) * gameWorldZoom,
+    y: height / 2 + shake.y + ((worldY - game.camera.y) - height / 2) * gameWorldZoom,
+  };
+}
+
+// 敌人的屏幕视觉中心：精灵按「脚下坐标 - 身高×0.32」绘制，再乘世界缩放
+function enemyVisualCenter(enemy) {
+  const bob = enemy.boss ? 0 : Math.sin(game.elapsed * 8 + enemy.x * 0.01) * 1.5;
+  const base = worldToScreen(enemy.x, enemy.y + bob);
+  if (enemy.boss) return { x: base.x, y: base.y - 2 * gameWorldZoom };
+  const spriteHeight = enemy.radius * (enemy.type === 'runner' ? 2.8 : 3.05) * gameWorldZoom;
+  return { x: base.x, y: base.y - spriteHeight * 0.32 };
+}
+
+// 锁定环半径：包住精灵主体（不是脚下碰撞半径）
+function enemyLockRadius(enemy) {
+  if (enemy.boss) return 52;
+  const spriteHeight = enemy.radius * (enemy.type === 'runner' ? 2.8 : 3.05) * gameWorldZoom;
+  return Math.max(16, spriteHeight * 0.54);
+}
+
+function aimArrowGeometry() {
+  const playerScreen = worldToScreen(game.player.x, game.player.y);
+  const playerX = playerScreen.x;
+  const playerY = playerScreen.y;
+  const cross = aimCrosshair();
+  const length = cross.length;
+  const dirX = cross.dirX;
+  const dirY = cross.dirY;
+  const startX = playerX + dirX * 18;
+  const startY = playerY + dirY * 18;
+  const endX = playerX + dirX * length;
+  const endY = playerY + dirY * length;
+  const target = game.aimTarget && game.aimTarget.health > 0 ? game.aimTarget : null;
+  return { startX, startY, endX, endY, dirX, dirY, target, dashDistance: length };
 }
 
 function drawGame() {
@@ -4440,6 +6527,7 @@ function drawGame() {
   context.scale(gameWorldZoom, gameWorldZoom);
   context.translate(-width / 2, -height / 2);
   drawGameBackground();
+  drawTimeTint();
 
   for (const landmark of game.landmarks) drawLandmark(landmark);
 
@@ -4551,6 +6639,21 @@ function drawGame() {
       context.font = 'bold 11px sans-serif';
       context.fillText('首领', enemyX, enemyY - (bossReady ? 88 : enemy.radius + 15));
     }
+    // 破甲层数：头顶小三角（3 层时最亮），让「击退有价值」变成看得见的东西
+    if ((enemy.armorBreak || 0) > 0) {
+      const marks = Math.min(balance.armorBreakMax, enemy.armorBreak);
+      for (let markIndex = 0; markIndex < marks; markIndex += 1) {
+        const markX = enemyX - (marks - 1) * 6 + markIndex * 12;
+        const markY = enemyY - (enemy.boss ? 96 : enemy.radius + 18);
+        context.fillStyle = markIndex + 1 >= marks ? '#ffb347' : UI.warn;
+        context.beginPath();
+        context.moveTo(markX, markY - 6);
+        context.lineTo(markX + 4, markY);
+        context.lineTo(markX - 4, markY);
+        context.closePath();
+        context.fill();
+      }
+    }
     // Stunned by a grenade: orbiting dots read instantly as "this one is out of action".
     if (enemy.stun > 0) {
       const orbitY = enemyY - enemy.radius - 14;
@@ -4589,8 +6692,18 @@ function drawGame() {
   for (const grenade of game.grenades) {
     const progress = Math.min(1, grenade.elapsed / grenade.duration);
     const x = grenade.fromX + (grenade.x - grenade.fromX) * progress - game.camera.x;
-    const y = grenade.fromY + (grenade.y - grenade.fromY) * progress - game.camera.y - Math.sin(progress * Math.PI) * 76;
+    const y = grenade.fromY + (grenade.y - grenade.fromY) * progress - game.camera.y - Math.sin(progress * Math.PI) * (grenade.arcHeight || 76);
     const size = 11 + progress * 35;
+    if (progress > 0.02) {
+      context.save();
+      context.globalAlpha = 0.35;
+      context.strokeStyle = UI.aimGold;
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(grenade.x - game.camera.x, grenade.y - game.camera.y, Math.max(14, game.grenadeRadius * gameWorldZoom), 0, Math.PI * 2);
+      context.stroke();
+      context.restore();
+    }
     if (grenadeReady) context.drawImage(grenadeSprite, x - size / 2, y - size / 2, size, size);
     else { context.fillStyle = '#e9bd43'; context.beginPath(); context.arc(x, y, size / 2, 0, Math.PI * 2); context.fill(); }
   }
@@ -4694,12 +6807,22 @@ function drawGame() {
     const progress = 1 - wave.life / wave.maxLife;
     const x = wave.x - game.camera.x;
     const y = wave.y - game.camera.y;
+    const waveRadius = wave.radius * progress;
+    // 发光用构建期烘出来的径向贴图（fx-glow.png）+ 加法混合：一次 drawImage，
+    // 比每帧描一圈带 shadowBlur 的弧便宜一个数量级。贴图没准备好就跳过，仍然有描边环。
+    if (fxGlowReady && waveRadius > 4) {
+      context.save();
+      context.globalCompositeOperation = 'lighter';
+      context.globalAlpha = Math.max(0, 1 - progress) * 0.5;
+      context.drawImage(fxGlowSprite, x - waveRadius, y - waveRadius, waveRadius * 2, waveRadius * 2);
+      context.restore();
+    }
     context.save();
     context.globalAlpha = Math.max(0, 1 - progress) * 0.9;
     context.strokeStyle = '#fff0a8';
     context.lineWidth = 7 * (1 - progress) + 1.5;
     context.beginPath();
-    context.arc(x, y, wave.radius * progress, 0, Math.PI * 2);
+    context.arc(x, y, waveRadius, 0, Math.PI * 2);
     context.stroke();
     context.restore();
   }
@@ -4712,7 +6835,7 @@ function drawGame() {
     context.font = number.critical ? 'bold 20px sans-serif' : 'bold 14px sans-serif';
     context.lineWidth = 3;
     context.strokeStyle = '#563a2f';
-    const label = `-${number.value}${number.critical ? '!!!' : ''}`;
+    const label = `-${fmtInt(number.value)}${number.critical ? '!!!' : ''}`;
     context.strokeText(label, number.x - game.camera.x, number.y - game.camera.y);
     context.fillStyle = number.color || elementalDamageColors.physical;
     context.fillText(label, number.x - game.camera.x, number.y - game.camera.y);
@@ -4749,27 +6872,27 @@ function drawGame() {
     context.restore();
   }
 
-  // 赤焰弹幕 ring. Each shot draws a slice of the circle centred on its own bearing; the slice
-  // widens as the ring fills up, so the barrage visibly closes into a solid 弹幕圈 around him
-  // instead of reading as a handful of scattered dots.
+  for (const bolt of (game.lightningBolts || [])) {
+    const alpha = Math.max(0, bolt.life / bolt.maxLife);
+    context.save();
+    context.globalAlpha = alpha;
+    context.strokeStyle = UI.dashCyan;
+    context.lineWidth = 2.5;
+    context.beginPath();
+    context.moveTo(bolt.fromX - game.camera.x, bolt.fromY - game.camera.y);
+    context.lineTo(bolt.toX - game.camera.x, bolt.toY - game.camera.y);
+    context.stroke();
+    context.restore();
+  }
+
+  // 赤焰弹幕：只画每颗子弹本体（原先每发之间还有一段连接弧，会形成环绕角色的橙红透明圈，已删除）。
   const ringCount = game.radialBullets.length;
-  const ringFullness = radialRingFullness(ringCount);
   for (const bullet of game.radialBullets) {
     // Radial shots dim as they expire, so the ring reads as a wave passing through.
     const alpha = Math.max(0, Math.min(1, bullet.life / balance.radialBulletLife));
     context.save();
     context.globalAlpha = 0.3 + alpha * 0.7;
-    // The connecting arc: a dash when the ring is sparse, a nearly unbroken band when full.
-    const step = bullet.step || (Math.PI * 2 / Math.max(1, ringCount));
-    const arcSpan = step * (balance.radialRingArcMin + (1 - balance.radialRingArcMin) * ringFullness);
-    const bearing = Math.atan2(bullet.y - game.player.y, bullet.x - game.player.x);
-    const orbit = Math.hypot(bullet.x - game.player.x, bullet.y - game.player.y);
-    context.strokeStyle = `rgba(255, 150, 40, ${0.28 + ringFullness * 0.45})`;
-    context.lineWidth = 5 + ringFullness * 4;
-    context.lineCap = 'round';
-    context.beginPath();
-    context.arc(game.player.x - game.camera.x, game.player.y - game.camera.y, orbit, bearing - arcSpan / 2, bearing + arcSpan / 2);
-    context.stroke();
+    // 只画子弹本体：连接弧会形成一圈橙红透明线，影响画面干净度（用户要求删除）
     const x = bullet.x - game.camera.x;
     const y = bullet.y - game.camera.y;
     context.fillStyle = '#d92f14';
@@ -4840,8 +6963,17 @@ function drawGame() {
   const isMoving = Math.abs(game.input.x) + Math.abs(game.input.y) > 0.08;
   const stepBob = isMoving ? Math.sin(game.elapsed * 16) * 2 : 0;
   if (game.dashTimer > 0) {
-    context.strokeStyle = 'rgba(143, 230, 233, 0.85)'; context.lineWidth = 3; context.beginPath();
+    context.strokeStyle = UI.dashRing; context.lineWidth = 3; context.beginPath();
     context.arc(playerX, playerY, 34 + (balance.dashDuration - game.dashTimer) * 38, 0, Math.PI * 2); context.stroke();
+    // 速度线：沿冲刺方向反向拖 5 条，比一圈光环更能表达「在冲」
+    context.strokeStyle = UI.dashLine;
+    for (let lineIndex = 0; lineIndex < 5; lineIndex += 1) {
+      const offset = (lineIndex - 2) * 7;
+      context.beginPath();
+      context.moveTo(playerX - game.dashX * 26 - game.dashY * offset, playerY - game.dashY * 26 + game.dashX * offset);
+      context.lineTo(playerX - game.dashX * 78 - game.dashY * offset, playerY - game.dashY * 78 + game.dashX * offset);
+      context.stroke();
+    }
   }
   if (isMoving && speedCloudReady) {
     context.save();
@@ -4854,6 +6986,22 @@ function drawGame() {
   const activeSprite = getCharacterSprite(game.character);
   const activeSpriteReady = isCharacterSpriteReady(game.character);
   const render = characterRender[game.character] || characterRender.supreme;
+  // 冲刺残影：3 个采样点，越旧越淡（让「冲过一段距离」在视觉上成立）
+  if (game.dashGhosts && game.dashGhosts.length) {
+    game.dashGhosts.forEach((ghost) => {
+      const ratio = Math.max(0, ghost.life / balance.dashGhostLife);
+      if (ratio <= 0) return;
+      drawFacingSprite(
+        activeSprite,
+        ghost.x - game.camera.x,
+        ghost.y - game.camera.y - render.lift,
+        render.width,
+        render.height,
+        ghost.facing,
+        0.42 * ratio,
+      );
+    });
+  }
   if (activeSpriteReady) {
     drawFacingSprite(activeSprite, playerX, playerY - render.lift + stepBob, render.width, render.height, game.facing, game.damageCooldown > 0 && game.dashTimer <= 0 ? 0.7 : 1);
     if (game.character === 'supreme') {
@@ -5108,65 +7256,66 @@ function drawGame() {
 
   context.restore();
 
-  context.fillStyle = 'rgba(255, 250, 226, 0.92)';
-  roundedRect(16, 18, width - 32, 84, 14);
+  drawAimOverlay();
+
+  // ---- 顶部 HUD ------------------------------------------------------------------
+  // hudTop = 安全区 + HUD_TOP_GAP：面板不贴屏幕边，刘海机型上再让出状态栏。
+  const hudTop = viewInsets.top + HUD_TOP_GAP;
+  const hudHeight = 58;
+  context.fillStyle = 'rgba(255, 250, 226, 0.88)';
+  roundedRect(16, hudTop, width - 32, hudHeight, 12);
+  // 第 1 行：生命条 + 等级/武器 + 暂停圆钮
   context.textAlign = 'left';
-  context.fillStyle = '#315e37';
-  context.font = 'bold 14px sans-serif';
-  context.fillText('生命', 28, 42);
-  drawBar(66, 31, Math.max(70, width * 0.35), 12, game.health, game.maxHealth, '#d76c54');
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 10px sans-serif';
+  context.fillText('生命', 56, hudTop + 22);
+  drawBar(88, hudTop + 12, Math.max(56, width * 0.34), 10, game.health, game.maxHealth, '#d76c54');
   context.textAlign = 'right';
-  context.fillText(game.character === 'rabbit'
-    ? `Lv.${game.level} · 攻 ${game.baseAttack + game.bonusAttack + game.bulletDamage} · 弹 ${game.projectileCount} · 击退 ${game.knockback}`
-    : game.character === 'daxia'
-      ? `Lv.${game.level} · 攻 ${game.baseAttack + game.bonusAttack + game.swordDamage} · ${swordWaveMode() === 'ji' ? `寂 ×${game.swordJiScale.toFixed(1)}` : swordWaveMode() === 'formation' ? `无极剑阵 ${game.swordWaveCount}` : `刀 ${game.swordWaveCount}`} · 击退 ${game.knockback}`
-      : game.character === 'xiaoxian'
-        ? `Lv.${game.level} · 攻 ${game.baseAttack + game.bonusAttack + game.umbrellaDamage} · ${hasUmbrella() ? '伞在手中' : '玉衣生效'} · 击退 ${game.knockback}`
-        : `Lv.${game.level} · 攻 ${game.baseAttack + game.bonusAttack} · 棍 ${game.orbitStickCount} · 击退 ${game.knockback}`, width - 28, 42);
+  context.font = 'bold 10px sans-serif';
+  context.fillText(compactStatLine(), width - 56, hudTop + 22);
+  const pauseButton = pauseButtonBounds();
+  const pauseCenterX = pauseButton.x + pauseButton.width / 2;
+  const pauseCenterY = pauseButton.y + pauseButton.height / 2;
+  context.fillStyle = UI.leafButton;
+  context.beginPath(); context.arc(pauseCenterX, pauseCenterY, 12, 0, Math.PI * 2); context.fill();
+  context.strokeStyle = UI.cream;
+  context.lineWidth = 2.4;
+  context.lineCap = 'round';
+  context.beginPath();
+  context.moveTo(pauseCenterX - 3.5, pauseCenterY - 5); context.lineTo(pauseCenterX - 3.5, pauseCenterY + 5);
+  context.moveTo(pauseCenterX + 3.5, pauseCenterY - 5); context.lineTo(pauseCenterX + 3.5, pauseCenterY + 5);
+  context.stroke();
+  // 第 2 行：波次/击杀/首领 + 计时（种子挪到暂停界面）
   context.textAlign = 'left';
-  context.font = 'bold 12px sans-serif';
-  context.fillText(game.bossSpawned && !game.endless ? '首领战' : game.endless ? `无尽 ${Math.floor(game.elapsed - (game.endlessStart || 0))} 秒` : `波 ${game.wave} · 击杀 ${game.waveKills}/${game.waveGoal}`, 28, 66);
-  // （刀势条已删除：该机制整体移除，HUD 上不再有这条资源槽）
-  if (game.character === 'xiaoxian' && game.umbrellas.some((u) => u.state !== 'held')) {
-    context.textAlign = 'left';
-    context.font = 'bold 9px sans-serif';
-    context.fillStyle = '#5f8f7c';
-    context.fillText('点击伞可提前收回', 100, 68);
-  }
-  // 弹幕圈 progress: shows how close the ring is to closing into a full circle.
-  if (game.character === 'rabbit' && game.radialShotCount > 0) {
-    const shots = radialShotCount();
-    const fullness = radialRingFullness(shots);
-    context.fillStyle = 'rgba(53, 79, 43, 0.22)';
-    roundedRect(100, 60, 118, 8, 4);
-    context.fillStyle = fullness >= 1 ? '#ff9b2f' : '#e0743a';
-    roundedRect(100, 60, Math.max(2, 118 * fullness), 8, 4);
-    context.textAlign = 'left';
-    context.font = 'bold 9px sans-serif';
-    context.fillStyle = fullness >= 1 ? '#b3511b' : '#71805c';
-    context.fillText(fullness >= 1 ? `弹幕圈 · 成型 ${shots} 发` : `弹幕圈 ${shots} 发`, 224, 68);
-  }
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 10px sans-serif';
+  context.fillText(battleWaveLabel(), 26, hudTop + 42);
   context.textAlign = 'right';
-  context.font = '12px sans-serif';
-  context.fillText(`${Math.floor(game.elapsed / 60)}:${String(Math.floor(game.elapsed) % 60).padStart(2, '0')}`, width - 28, 66);
-  context.textAlign = 'center';
-  context.fillStyle = '#9b7435';
-  context.fillText(`种子 +${game.seedsEarned}`, width / 2, 66);
-  drawBar(28, 78, width - 56, 8, game.experience, game.experienceNeeded, '#e9b84f');
-  const currentEnemyBuff = getEnemyBuffTotals();
-  context.textAlign = 'center'; context.fillStyle = '#a45b42'; context.font = '10px sans-serif';
-  context.fillText(`怪物强化 速+${currentEnemyBuff.speed} 伤+${currentEnemyBuff.damage} 血+${currentEnemyBuff.health}×${currentEnemyBuff.healthMultiplier} 重+${currentEnemyBuff.weight}`, width / 2, 99);
-  const pauseButton = pauseButtonBounds();  context.fillStyle = 'rgba(49, 94, 55, 0.92)'; roundedRect(pauseButton.x, pauseButton.y, pauseButton.width, pauseButton.height, 9);
-  context.fillStyle = '#fff7d9'; context.font = 'bold 12px sans-serif'; context.textAlign = 'center'; context.fillText('暂停', pauseButton.x + pauseButton.width / 2, pauseButton.y + 20);
+  context.fillStyle = UI.moss;
+  context.font = '10px sans-serif';
+  context.fillText(String(Math.floor(game.elapsed / 60)) + ':' + String(Math.floor(game.elapsed) % 60).padStart(2, '0'), width - 26, hudTop + 42);
+  // 经验线贴面板底
+  drawBar(24, hudTop + 50, width - 48, 5, game.experience, game.experienceNeeded, '#e9b84f');
+  // HUD 提示（怪物强化/伞提示）：波次变化时出现 2.5 秒
+  if (game.hudToast && game.hudToast.life > 0) {
+    const toastWidth = Math.min(width - 64, 320);
+    context.fillStyle = UI.scrim;
+    roundedRect(width / 2 - toastWidth / 2, hudTop + hudHeight + 10, toastWidth, 26, 9);
+    context.fillStyle = UI.cream;
+    context.font = 'bold 10px sans-serif';
+    context.textAlign = 'center';
+    context.fillText(game.hudToast.text, width / 2, hudTop + hudHeight + 27, toastWidth - 16);
+  }
+
 
   const boss = game.enemies.find((enemy) => enemy.boss);
   if (!boss && game.waveNotice > 0) {
     context.textAlign = 'center';
     context.fillStyle = 'rgba(49, 94, 55, 0.88)';
-    roundedRect(width / 2 - 88, 112, 176, 38, 12);
-    context.fillStyle = '#fff7d9';
+    roundedRect(width / 2 - 88, viewInsets.top + HUD_TOP_GAP + 62, 176, 38, 12);
+    context.fillStyle = UI.cream;
     context.font = 'bold 16px sans-serif';
-    context.fillText(`第 ${game.wave} 波`, width / 2, 137);
+    context.fillText(`第 ${fmtInt(game.wave)} 波`, width / 2, viewInsets.top + HUD_TOP_GAP + 87);
   }
 
   if (joystickTouchId !== null && joystickOrigin) {
@@ -5182,28 +7331,88 @@ function drawGame() {
   }
 
   const skillButton = skillButtonBounds();
-  const cooldown = activeSkillCooldown();
-  const cooldownMax = activeSkillCooldownMax();
-  context.fillStyle = cooldown <= 0 ? 'rgba(49, 94, 55, 0.9)' : 'rgba(49, 94, 55, 0.62)';
+  const supremeCharges = game.character === 'supreme' ? (game.dashCharges || 0) : 0;
+  const supremeMax = game.character === 'supreme' ? (game.dashChargeMax || balance.dashChargeMaxBase) : 0;
+  const supremeRecharge = game.character === 'supreme' ? (game.dashRecharge || balance.dashRecharge) : balance.dashRecharge;
+  const supremeTimer = game.character === 'supreme' ? (game.dashChargeTimer || 0) : 0;
+  const cooldown = game.character === 'supreme'
+    ? (supremeCharges > 0 ? 0 : Math.max(0, supremeRecharge - supremeTimer))
+    : activeSkillCooldown();
+  const cooldownMax = game.character === 'supreme' ? supremeRecharge : activeSkillCooldownMax();
+  const skillUsable = game.character === 'supreme' ? supremeCharges > 0 : cooldown <= 0;
+  context.fillStyle = skillUsable ? 'rgba(49, 94, 55, 0.9)' : 'rgba(49, 94, 55, 0.62)';
   context.beginPath(); context.arc(skillButton.x, skillButton.y, skillButton.radius, 0, Math.PI * 2); context.fill();
-  context.strokeStyle = '#fff7d9'; context.lineWidth = 2; context.beginPath();
-  context.arc(skillButton.x, skillButton.y, skillButton.radius - 3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (1 - cooldown / cooldownMax)); context.stroke();
+  context.strokeStyle = UI.cream; context.lineWidth = 2; context.beginPath();
+  if (game.character === 'supreme') {
+    // 满格 = 整圈；未满 = 下一格的回复进度
+    const chargeRatio = supremeCharges >= supremeMax ? 1 : Math.min(1, supremeTimer / supremeRecharge);
+    context.arc(skillButton.x, skillButton.y, skillButton.radius - 3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * chargeRatio);
+  } else {
+    context.arc(skillButton.x, skillButton.y, skillButton.radius - 3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (1 - cooldown / cooldownMax));
+  }
+  context.stroke();
+  // 冷却刚转好：外圈脉冲一下，玩家才知道技能可用了（不然只能盯着小字）
+  // 瞄准态：技能键外圈常亮，提示「还按着」
+  if (game.aimActive) {
+    context.strokeStyle = UI.aimGoldStroke;
+    context.lineWidth = 3;
+    context.beginPath();
+    context.arc(skillButton.x, skillButton.y, skillButton.radius + 6, 0, Math.PI * 2);
+    context.stroke();
+  }
+
+  const readyElapsed = game.elapsed - (game.dashReadyAt === undefined ? -999 : game.dashReadyAt);
+  if (game.character === 'supreme' && readyElapsed >= 0 && readyElapsed < balance.dashReadyPulse) {
+    const progress = 1 - readyElapsed / balance.dashReadyPulse;
+    context.save();
+    context.globalAlpha = progress * 0.9;
+    context.strokeStyle = UI.warn;
+    context.lineWidth = 2.5;
+    context.beginPath();
+    context.arc(skillButton.x, skillButton.y, skillButton.radius + 4 + (1 - progress) * 8, 0, Math.PI * 2);
+    context.stroke();
+    context.restore();
+  }
+  if (game.character === 'supreme') {
+    // 充能点（最多 4 个）：金 = 可用，灰 = 空
+    for (let chargeIndex = 0; chargeIndex < supremeMax; chargeIndex += 1) {
+      const filled = chargeIndex < supremeCharges;
+      context.fillStyle = filled ? UI.dashGold : UI.creamMuted;
+      context.beginPath();
+      context.arc(skillButton.x - (supremeMax - 1) * 7 + chargeIndex * 14, skillButton.y - skillButton.radius - 28, 4, 0, Math.PI * 2);
+      context.fill();
+    }
+    // 棍意：按钮上方三段进度条（棍击攒、冲刺消耗）
+    {
+      const barHeight = 5;
+      const barY = skillButton.y - skillButton.radius - 16;
+      const segmentWidth = 14;
+      const segmentGap = 2;
+      const startX = skillButton.x - (segmentWidth * 3 + segmentGap * 2) / 2;
+      for (let rodIndex = 0; rodIndex < 3; rodIndex += 1) {
+        const filled = rodIndex < (game.rodMeter || 0);
+        context.fillStyle = filled ? UI.dashGold : UI.creamMuted;
+        roundedRect(startX + rodIndex * (segmentWidth + segmentGap), barY, segmentWidth, barHeight, 2);
+      }
+    }
+  }
+
   if (game.character === 'rabbit' && grenadeReady && cooldown <= 0) {
     context.drawImage(grenadeSprite, skillButton.x - 15, skillButton.y - 15, 30, 30);
   } else {
-    context.textAlign = 'center'; context.fillStyle = '#fff7d9'; context.font = 'bold 13px sans-serif';
-    context.fillText(cooldown > 0 ? `${cooldown.toFixed(1)}s` : activeSkillLabel(), skillButton.x, skillButton.y + 5);
+    context.textAlign = 'center'; context.fillStyle = UI.cream; context.font = 'bold 13px sans-serif';
+    context.fillText(skillUsable ? activeSkillLabel() : `${fmtCeil(cooldown)}s`, skillButton.x, skillButton.y + 5);
   }
   if (game.plantNotice) {
     context.fillStyle = 'rgba(255, 250, 226, 0.93)'; roundedRect(width / 2 - Math.min(170, width * 0.43), height * 0.42, Math.min(340, width * 0.86), 40, 12);
-    context.fillStyle = '#315e37'; context.font = 'bold 13px sans-serif'; context.textAlign = 'center';
+    context.fillStyle = UI.leaf; context.font = 'bold 13px sans-serif'; context.textAlign = 'center';
     context.fillText(game.plantNotice.text, width / 2, height * 0.42 + 25);
   }
   if (game.event) {
     const title = game.event.type === 'garden' ? '守护花圃' : game.event.type === 'harvest' ? '限时采集' : '精英怪突袭';
     const progress = game.event.type === 'garden' ? `${Math.floor(game.event.progress)}/${game.event.goal} 秒` : `${game.event.progress}/${game.event.goal}`;
     context.fillStyle = 'rgba(49, 94, 55, 0.9)'; roundedRect(width / 2 - 106, height * 0.31, 212, 36, 11);
-    context.fillStyle = '#fff7d9'; context.font = 'bold 12px sans-serif'; context.textAlign = 'center';
+    context.fillStyle = UI.cream; context.font = 'bold 12px sans-serif'; context.textAlign = 'center';
     context.fillText(`${title} ${progress} · ${Math.ceil(game.event.timer)}s`, width / 2, height * 0.31 + 23);
   }
   // Kill-streak readout: the main "you are mowing them down" feedback.
@@ -5229,33 +7438,380 @@ function drawGame() {
     context.restore();
   }
 
-  drawMiniMap();
+  // 首局引导：三步一次性提示（老存档 coachStep 直接是 3，不会出现）。
+  // 位置在摇杆上方，不压血条/连杀/地图 —— 这三块是战斗中要一直盯的。
+  if (game.coachStep >= 0 && game.coachStep < 3) {
+    const tips = [
+      '按住屏幕拖一拖，奶团子跟着你的手指走',
+      '攻击是自动的 —— 靠近敌人就会出手',
+      '升级了！点一张卡，再点「确认选择」',
+    ];
+    const hintY = height - viewInsets.bottom - 182;   // 随技能键上移，避免压住按键
+    const boxWidth = Math.min(width - 56, 320);
+    context.fillStyle = UI.paper;
+    roundedRect(width / 2 - boxWidth / 2, hintY, boxWidth, 38, 12);
+    context.fillStyle = UI.leaf;
+    context.font = 'bold 12px sans-serif';
+    context.textAlign = 'center';
+    context.fillText(tips[game.coachStep], width / 2, hintY + 24, boxWidth - 24);
+  }
+
+  drawAmbient();
+
+  drawEdgeIndicators();
 
   if (game.flash > 0) {
     context.fillStyle = `rgba(255, 248, 214, ${Math.min(0.45, game.flash)})`;
     context.fillRect(0, 0, width, height);
   }
+
+  if (perf.visible) drawPerfOverlay();
 }
 
+// 性能浮层：右上角时间区域连点 3 下打开。位置在暂停键下方，不挡生命条与地图。
+function drawPerfOverlay() {
+  const lines = perfLines();
+  const boxWidth = 132;
+  const boxHeight = 14 + lines.length * 13;
+  const x = 12;
+  const y = viewInsets.top + HUD_TOP_GAP + 92;
+  context.save();
+  context.fillStyle = UI.scrim;
+  roundedRect(x, y, boxWidth, boxHeight, 8);
+  context.textAlign = 'left';
+  context.font = 'bold 10px sans-serif';
+  lines.forEach((line, index) => {
+    const lowFps = index === 0 && perf.fps > 0 && perf.fps < 45;
+    context.fillStyle = lowFps ? UI.warn : UI.cream;
+    context.fillText(line, x + 8, y + 15 + index * 13);
+  });
+  context.save();
+  context.globalAlpha = 0.62;
+  context.fillStyle = UI.cream;
+  context.font = '9px sans-serif';
+  context.fillText('再点时间 3 下关闭', x + 8, y + boxHeight + 11);
+  context.restore();
+  context.restore();
+}
+
+function drawBossChoice() {
+  drawGame();
+  context.fillStyle = UI.scrim;
+  context.fillRect(0, 0, width, height);
+  const panel = bossChoicePanel();
+  drawPaperPanel(panel, 20);
+  context.textAlign = 'center';
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 26px sans-serif';
+  context.fillText('首领击退！', width / 2, panel.y + 46);
+  context.fillStyle = UI.moss;
+  context.font = '14px sans-serif';
+  context.fillText('本局已清理 ' + fmtInt(game.kills) + ' 只 · 坚持 ' + fmtInt(game.elapsed) + ' 秒', width / 2, panel.y + 74);
+  context.fillText('带走战利品结算，还是继续往后打？', width / 2, panel.y + 100);
+  const buttons = bossChoiceBounds();
+  [
+    { rect: buttons.settle, label: '结算', color: UI.leaf, size: 19 },
+    { rect: buttons.endless, label: '继续挑战', color: UI.leafButton, size: 17 },
+  ].forEach((button) => {
+    drawCelButton(button.rect, button.color, 14);
+    context.fillStyle = UI.cream;
+    context.font = 'bold ' + button.size + 'px sans-serif';
+    context.fillText(button.label, button.rect.x + button.rect.width / 2, button.rect.y + button.rect.height / 2 + 6);
+  });
+}
 function drawPause() {
   drawGame();
   context.fillStyle = 'rgba(24, 47, 29, 0.72)';
   context.fillRect(0, 0, width, height);
   context.textAlign = 'center';
-  context.fillStyle = '#fff7d9';
+  context.fillStyle = UI.cream;
   context.font = 'bold 28px sans-serif';
   context.fillText('游戏暂停', width / 2, height * 0.34);
+  context.fillStyle = UI.creamMuted;
+  context.font = 'bold 13px sans-serif';
+  context.fillText(`种子 +${fmtInt(game.seedsEarned)} · 第 ${fmtInt(game.wave)} 波`, width / 2, height * 0.34 + 26);
   const pauseMenu = pauseMenuBounds();
   [
-    { rect: pauseMenu.resume, label: '继续游戏', color: '#477a3c' },
-    { rect: pauseMenu.settle, label: '立马结算', color: '#b9654e' },
+    { rect: pauseMenu.resume, label: '继续游戏', color: UI.leafLight, size: 18 },
+    { rect: pauseMenu.stats, label: '角色面板', color: 'rgba(49, 94, 55, 0.86)', size: 16 },
+    { rect: pauseMenu.settle, label: '立马结算', color: '#b9654e', size: 18 },
   ].forEach((button) => {
-    context.fillStyle = button.color;
-    roundedRect(button.rect.x, button.rect.y, button.rect.width, button.rect.height, 14);
-    context.fillStyle = '#fff7d9';
-    context.font = 'bold 18px sans-serif';
-    context.fillText(button.label, width / 2, button.rect.y + 33);
+    drawCelButton(button.rect, button.color, 14);
+    context.fillStyle = UI.cream;
+    context.font = `bold ${button.size}px sans-serif`;
+    context.fillText(button.label, width / 2, button.rect.y + button.rect.height / 2 + 6);
   });
+}
+
+// ---- 角色面板（数据模型） ---------------------------------------------------------------
+// 这两个函数是纯数据：不读 context、不碰屏幕尺寸，所以 tools/stats-panel.test.mjs 可以
+// 在无头环境里直接断言「每一行都不含小数点、不含 NaN」。绘制代码只负责摆放。
+
+// 已经拿到的技能（按标题合并成等级）。升级确认时才记录，所以它精确等于「真的吃到了什么」。
+function equipmentSlots() {
+  const slots = [];
+  for (const entry of (game.upgradeLog || [])) {
+    const found = slots.find((item) => item.title === entry.title);
+    if (found) {
+      found.level += 1;
+      if (entry.evolution) found.evolution = true;
+    } else {
+      slots.push({ title: entry.title, level: 1, rarity: entry.rarity, evolution: !!entry.evolution });
+    }
+  }
+  return slots;
+}
+
+// 属性表：通用行 + 角色专属行。顺序即排版顺序（左列在前，右列接在后面）。
+function statRows() {
+  const weaponDamage = game.character === 'rabbit' ? game.bulletDamage
+    : game.character === 'daxia' ? game.swordDamage
+      : game.character === 'xiaoxian' ? game.umbrellaDamage : 0;
+  const rows = [
+    { label: '生命', value: `${fmtInt(game.health)}/${fmtInt(game.maxHealth)}` },
+    { label: '伤害', value: fmtInt(game.baseAttack + game.bonusAttack + weaponDamage) },
+    { label: '防御', value: fmtPercent(game.damageReduction) },
+    { label: '速度', value: fmtInt(game.moveSpeed) },
+    { label: '击退', value: fmtInt(game.knockback) },
+    { label: '攻击间隔', value: `${fmtInt(game.fireInterval * 1000)}毫秒` },
+    { label: '暴击率', value: fmtPercent(game.critChance) },
+    { label: '暴击倍率', value: `×${fmtInt(game.critMultiplier)}` },
+    { label: '攻击范围', value: fmtInt(game.attackRange) },
+    { label: '连杀峰值', value: fmtInt(game.bestCombo) },
+    { label: '本局击杀', value: fmtInt(game.kills) },
+    { label: '经验', value: `${fmtInt(game.experience)}/${fmtInt(game.experienceNeeded)}` },
+    { label: '种子', value: fmtInt(game.seedsEarned) },
+    { label: '金币', value: fmtInt(profile.coins) },
+    { label: '最高纪录', value: `${fmtInt(profile.bestTime)}秒` },
+  ];
+  if (game.character === 'rabbit') {
+    rows.push(
+      { label: '弹道', value: `${fmtInt(game.projectileCount)}发` },
+      { label: '穿透', value: fmtInt(game.projectilePierce) },
+      { label: '弹幕圈', value: `${fmtInt(radialShotCount())}发` },
+      { label: '反哺加成', value: fmtPercent(game.rabbitFeedBonus) },
+    );
+  } else if (game.character === 'daxia') {
+    rows.push(
+      { label: '刀光', value: `${fmtInt(game.swordWaveCount)}道` },
+      { label: '剑阵', value: swordWaveMode() === 'formation' || swordWaveMode() === 'ji' ? '已成型' : '未成型' },
+      { label: '寂', value: `+${fmtInt((game.swordJiScale - 1) * 100)}%` },
+      { label: '刀光衰减', value: game.swordNoFalloff ? '不衰减' : '正常' },
+    );
+  } else if (game.character === 'xiaoxian') {
+    rows.push(
+      { label: '伞数', value: `${fmtInt(game.umbrellas.length)}把` },
+      { label: '伞伤', value: fmtInt(game.umbrellaDamage) },
+      { label: '旋转伤害', value: `每秒${fmtPercent(game.umbrellaSpinRatio)}` },
+      { label: '反刺玉衣', value: thornRobePower() > 0 ? '生效' : '未解锁' },
+    );
+  } else {
+    rows.push(
+      { label: '棍数', value: `${fmtInt(game.orbitStickCount)}根` },
+      { label: '棍半径', value: fmtInt(game.orbitRadius) },
+      { label: '棍转速', value: fmtInt(game.orbitSpeed) },
+      { label: '冲刺充能', value: `${fmtInt(game.dashCharges || 0)}/${fmtInt(game.dashChargeMax || 2)}` },
+      { label: '每格回复', value: `${fmtInt(game.dashRecharge || balance.dashRecharge)}秒` },
+    );
+  }
+  return rows;
+}
+
+// ---- 角色面板（绘制） -------------------------------------------------------------------
+
+// 九宫格拉伸：纹理按 192px 设计，角 64px = 屏幕上的 21 CSS px。
+// 一次面板 = 9 次 drawImage，比「圆角 + 描边 + 阴影」三条路径便宜，而且不受基础库版本影响。
+function drawNineSlice(sprite, x, y, targetWidth, targetHeight, inset) {
+  if (!sprite || !sprite.width) return false;
+  const scale = sprite.width / 192;
+  const corner = inset * scale;
+  const sx = [0, corner, sprite.width - corner, sprite.width];
+  const sy = [0, corner, sprite.height - corner, sprite.height];
+  const dx = [x, x + inset, x + targetWidth - inset, x + targetWidth];
+  const dy = [y, y + inset, y + targetHeight - inset, y + targetHeight];
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = 0; column < 3; column += 1) {
+      const sw = sx[column + 1] - sx[column];
+      const sh = sy[row + 1] - sy[row];
+      const dw = dx[column + 1] - dx[column];
+      const dh = dy[row + 1] - dy[row];
+      if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) continue;
+      context.drawImage(sprite, sx[column], sy[row], sw, sh, dx[column], dy[row], dw, dh);
+    }
+  }
+  return true;
+}
+
+// 纸面：优先用烘焙好的九宫格贴图，贴图没准备好时退回纯色圆角（观感降级但绝不空屏）。
+// 再叠两层烘焙纹理：wash（水彩晕染，低频）+ grain（纸纹，高频）。三层都是 drawImage，
+// 一屏面板 = 11 次 drawImage，比每帧算渐变便宜，而且不受基础库版本影响。
+// 面板：白底卡片 + 2px 深绿描边 + 顶部高光 + 右下投影，再叠烘焙纹理（wash/grain）。
+// 贴图没准备好时仍然有描边和高光 —— 观感降级但结构不塌。
+// 面板：白底卡片 + 2px 深绿描边 + 顶部高光带 + 右下投影，再叠烘焙纹理（wash/grain）。
+// 注意：不要画「内圈 1px 描边」—— 那会在面板内缘留下一圈细线（用户截图里的那些线就是它），
+// 尤其叠了 panel9 烘焙贴图后，贴图内边框 + 这条线会变成双线。高光只用顶部一条填充带。
+function drawPaperPanel(panel, radius = UI.radius.panel) {
+  const x = Math.round(panel.x);
+  const y = Math.round(panel.y);
+  const w = Math.round(panel.width);
+  const h = Math.round(panel.height);
+  // 投影内缩 4px：和面板同宽时，投影的上边缘会从面板边缘露出一条深色细线
+  context.save();
+  context.fillStyle = UI.cardShadow;
+  roundedRect(x + 4, y + 6, w - 8, h - 6, radius);
+  context.restore();
+  const baked = drawNineSlice(uiPanelSprite, x, y, w, h, 21);
+  if (!baked) {
+    context.fillStyle = UI.paperSolid;
+    roundedRect(x, y, w, h, radius);
+  }
+  if (uiWashReady || uiGrainReady) {
+    context.save();
+    roundRectPath(x, y, w, h, radius);
+    context.clip();
+    if (uiWashReady) {
+      context.globalAlpha = 0.12;
+      context.drawImage(uiWashSprite, x, y, w, h);
+    }
+    if (uiGrainReady) {
+      context.globalAlpha = 0.09;
+      context.drawImage(uiGrainSprite, x, y, w, h);
+    }
+    context.restore();
+  }
+  // 顶部高光带（只在顶部，不围一圈）
+  context.save();
+  roundRectPath(x, y, w, h, radius);
+  context.clip();
+  context.fillStyle = UI.cardTop;
+  context.globalAlpha = 0.42;
+  context.fillRect(x, y, w, Math.max(6, Math.round(h * 0.06)));
+  context.restore();
+  // 外描边
+  context.save();
+  context.strokeStyle = UI.cardEdge;
+  context.lineWidth = 2;
+  roundRectPath(x + 1, y + 1, w - 2, h - 2, radius);
+  context.stroke();
+  context.restore();
+}
+
+// 按钮：实心色块 + 2px 深绿描边 + 顶部高光条 + 底部投影
+function drawCelButton(rect, color, radius = 14) {
+  const x = Math.round(rect.x);
+  const y = Math.round(rect.y);
+  const w = Math.round(rect.width);
+  const h = Math.round(rect.height);
+  context.save();
+  // 投影左右各缩 4px：与按钮同宽时会从底边露出一条深色细线
+  context.fillStyle = UI.cardShadow;
+  roundedRect(x + 4, y + 4, w - 8, h - 4, radius);
+  context.fillStyle = color;
+  roundedRect(x, y, w, h, radius);
+  context.strokeStyle = UI.cardEdge;
+  context.lineWidth = 2;
+  roundRectPath(x + 1, y + 1, w - 2, h - 2, radius);
+  context.stroke();
+  // 顶部高光条（填充，不描边，避免细线）
+  context.fillStyle = UI.cardTop;
+  context.globalAlpha = 0.26;
+  roundedRect(x + 8, y + 5, w - 16, Math.max(4, Math.round(h * 0.16)), 4);
+  context.restore();
+}
+
+function drawStatCell(rect, slot) {
+  const rarityColor = slot && skillRarity[slot.rarity] ? skillRarity[slot.rarity].color : UI.moss;
+  context.fillStyle = 'rgba(255, 255, 255, 0.72)';
+  roundedRect(rect.x, rect.y, rect.width, rect.height, UI.radius.chip);
+  if (slot && slot.evolution) {
+    context.strokeStyle = UI.gold;
+    context.lineWidth = 2;
+    roundRectPath(rect.x, rect.y, rect.width, rect.height, UI.radius.chip);
+    context.stroke();
+  }
+  // 稀有度色条：没有技能图标，就用颜色 + 标题把「这是什么档位的技能」讲清楚。
+  context.fillStyle = rarityColor;
+  roundedRect(rect.x + 4, rect.y + 4, rect.width - 8, 3, 2);
+  context.textAlign = 'center';
+  context.fillStyle = UI.ink;
+  context.font = 'bold 10px sans-serif';
+  const title = slot ? slot.title : '空';
+  context.fillText(title.length > 4 ? `${title.slice(0, 4)}` : title, rect.x + rect.width / 2, rect.y + 22, rect.width - 8);
+  context.fillStyle = slot ? UI.amber : UI.moss;
+  context.font = '9px sans-serif';
+  context.fillText(slot ? `Lv.${fmtInt(slot.level)}` : '—', rect.x + rect.width / 2, rect.y + 36);
+}
+
+function drawStats() {
+  drawGame();
+  context.fillStyle = UI.scrim;
+  context.fillRect(0, 0, width, height);
+  const panel = statsPanel();
+  drawPaperPanel(panel);
+
+  const character = characters.find((item) => item.id === game.character) || characters[0];
+  context.textAlign = 'center';
+  context.fillStyle = UI.ink;
+  context.font = 'bold 26px sans-serif';
+  context.fillText('角色面板', width / 2, panel.y + 38);
+  context.fillStyle = UI.moss;
+  context.font = '12px sans-serif';
+  context.fillText(`${character.name} · ${character.style} · Lv.${fmtInt(game.level)}`, width / 2, panel.y + 58);
+
+  // 技能格
+  context.textAlign = 'left';
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 11px sans-serif';
+  const slots = equipmentSlots();
+  context.fillText('已获得技能', panel.x + 16, panel.y + 84);
+  context.textAlign = 'right';
+  context.fillStyle = UI.moss;
+  context.font = '10px sans-serif';
+  context.fillText(`${fmtInt(slots.length)} 种`, panel.x + panel.width - 16, panel.y + 84);
+  for (let index = 0; index < 8; index += 1) {
+    drawStatCell(statsSlotBounds(index), slots[index] || null);
+  }
+
+  // 属性表
+  const rows = statRows();
+  const rowsPerColumn = Math.ceil(rows.length / 2);
+  context.textAlign = 'left';
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 11px sans-serif';
+  context.fillText('属性', panel.x + 16, panel.y + 210);
+  rows.forEach((row, index) => {
+    const rect = statsRowBounds(index, rows.length);
+    const midY = rect.y + rect.height / 2;
+    context.textAlign = 'left';
+    context.fillStyle = UI.moss;
+    context.font = '11px sans-serif';
+    context.fillText(row.label, rect.x + 8, midY + 4);
+    context.textAlign = 'right';
+    context.fillStyle = UI.ink;
+    context.font = 'bold 12px sans-serif';
+    context.fillText(row.value, rect.x + rect.width - 8, midY + 4);
+  });
+  // 列之间一条发丝线，避免两列数值粘在一起
+  if (rowsPerColumn > 0) {
+    const divider = statsRowBounds(0, rows.length);
+    context.fillStyle = 'rgba(122, 138, 96, 0.28)';
+    context.fillRect(divider.x + divider.width + 2, divider.y + 4, 1, Math.max(0, divider.rowHeight * rowsPerColumn - 8));
+  }
+
+  // 底部：关卡进度（对应参考稿最下面那条进度）
+  const barY = panel.y + panel.height - 60;
+  const barWidth = panel.width - 40;
+  const progress = Math.max(0, Math.min(1, game.waveGoal ? game.waveKills / game.waveGoal : 0));
+  context.textAlign = 'center';
+  context.fillStyle = UI.moss;
+  context.font = '10px sans-serif';
+  context.fillText(`第 ${fmtInt(game.wave)} 波 · 击杀 ${fmtInt(game.waveKills)}/${fmtInt(game.waveGoal)} · ${fmtPercent(progress)}`, width / 2, barY);
+  context.fillStyle = 'rgba(31, 57, 35, 0.28)';
+  roundedRect(panel.x + 20, barY + 8, barWidth, 8, 4);
+  context.fillStyle = UI.leafLight;
+  roundedRect(panel.x + 20, barY + 8, Math.max(2, barWidth * progress), 8, 4);
+
+  drawBackButton(panel);
 }
 
 function upgradeCardBounds(index) {
@@ -5303,16 +7859,25 @@ function drawUpgrade() {
   context.fillStyle = 'rgba(24, 47, 29, 0.72)';
   context.fillRect(0, 0, width, height);
   context.textAlign = 'center';
-  context.fillStyle = '#fff7d9';
+  context.fillStyle = UI.cream;
   context.font = 'bold 24px sans-serif';
   context.fillText('升级啦！选择一项', width / 2, height * 0.22);
   context.font = '14px sans-serif';
-  context.fillText(`${characters.find((c) => c.id === game.character).name} · ${characterCodices[game.character].split(' · ')[0]} · Lv.${game.level}`, width / 2, height * 0.22 + 25);
+  context.fillText(`${characters.find((c) => c.id === game.character).name} · ${characterCodices[game.character].split(' · ')[0]} · Lv.${fmtInt(game.level)}`, width / 2, height * 0.22 + 25);
+
+  // 角色面板入口：升级这一刻是全屏唯一「可以停下来看数」的时机，所以入口放在这里。
+  const statsButton = statsOpenBounds();
+  context.fillStyle = 'rgba(255, 250, 226, 0.92)';
+  roundedRect(statsButton.x, statsButton.y, statsButton.width, statsButton.height, UI.radius.chip);
+  context.fillStyle = UI.leaf;
+  context.font = 'bold 12px sans-serif';
+  context.textAlign = 'center';
+  context.fillText('角色面板', statsButton.x + statsButton.width / 2, statsButton.y + 19);
 
   game.upgradeChoices.forEach((upgrade, index) => {
     const card = upgradeCardBounds(index);
     const isEvolution = !!upgrade.evolution;
-    context.fillStyle = isEvolution ? '#fff2cd' : '#fff7d9';
+    context.fillStyle = isEvolution ? '#fff2cd' : UI.cream;
     roundedRect(card.x, card.y, card.width, card.height, 14);
     if (isEvolution) {
       context.strokeStyle = '#c58a13';
@@ -5337,16 +7902,29 @@ function drawUpgrade() {
       const chip = upgradeDetailBounds(index);
       context.fillStyle = '#eef2e2';
       roundedRect(chip.x, chip.y, chip.width, chip.height, 10);
-      context.fillStyle = '#5f7a4a';
+      context.fillStyle = UI.leafLight;
       context.font = 'bold 10px sans-serif';
       context.textAlign = 'center';
       context.fillText('详细 ›', chip.x + chip.width / 2, chip.y + 14);
     }
     context.textAlign = 'right';
-    context.fillStyle = '#b37c2e';
+    context.fillStyle = UI.amberDark;
     context.font = 'bold 11px sans-serif';
     context.fillText('选择 ›', card.x + card.width - 14, card.y + 82);
   });
+
+  // 金币出口：重抽。每次升级从 1 金币起、2 倍递增、无次数上限；按钮只说清这一次多少钱。
+  const reroll = rerollButtonBounds();
+  const rerollAffordable = profile.coins >= rerollCost();
+  context.fillStyle = rerollAffordable ? UI.leafButton : UI.leafButtonDim;
+  roundedRect(reroll.x, reroll.y, reroll.width, reroll.height, 14);
+  context.fillStyle = UI.cream;
+  context.font = 'bold 14px sans-serif';
+  context.textAlign = 'center';
+  context.fillText(rerollLabel(), width / 2, reroll.y + 26);
+  context.fillStyle = UI.creamMuted;
+  context.font = '10px sans-serif';
+  context.fillText(`金币 ${fmtInt(profile.coins)}`, width / 2, reroll.y + reroll.height + 16);
 }
 
 // The dedicated long-text page, opened from a card's 详细 chip.
@@ -5357,14 +7935,14 @@ function drawUpgradeDetail() {
   const panel = upgradeDetailPanel();
   const upgrade = game.upgradeChoices[upgradeDetailIndex];
   if (!upgrade) return;
-  context.fillStyle = '#fff7d9';
-  roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
+  context.fillStyle = UI.cream;
+  drawPaperPanel(panel, 18);
   const rarity = skillRarity[upgrade.rarity];
   context.textAlign = 'center';
   context.fillStyle = rarity.color;
   context.font = 'bold 12px sans-serif';
   context.fillText(upgrade.evolution ? '★ 武器进化' : `${rarity.label}技能`, width / 2, panel.y + 26);
-  context.fillStyle = '#315e37';
+  context.fillStyle = UI.leaf;
   context.font = 'bold 20px sans-serif';
   context.fillText(upgrade.title, width / 2, panel.y + 52, panel.width - 32);
   context.fillStyle = '#eef2e2';
@@ -5377,10 +7955,10 @@ function drawUpgradeDetail() {
   context.font = '10px sans-serif';
   drawWrappedText(enemyBuffDescription(upgrade.rarity), panel.x + 20, panel.y + panel.height - 74, panel.width - 40, 14, 2, 10);
   const back = upgradeDetailBackBounds();
-  context.fillStyle = '#477a3c';
+  context.fillStyle = UI.leafLight;
   roundedRect(back.x, back.y, back.width, back.height, 12);
   context.textAlign = 'center';
-  context.fillStyle = '#fff7d9';
+  context.fillStyle = UI.cream;
   context.font = 'bold 13px sans-serif';
   context.fillText('返回', back.x + back.width / 2, back.y + 25);
 }
@@ -5397,19 +7975,19 @@ function drawUpgradeConfirm() {
   context.fillStyle = 'rgba(20, 35, 22, 0.72)';
   context.fillRect(0, 0, width, height);
   const panel = { x: width * 0.09, y: height * 0.40, width: width * 0.82, height: height * 0.25 };
-  context.fillStyle = '#fff7d9';
-  roundedRect(panel.x, panel.y, panel.width, panel.height, 18);
+  context.fillStyle = UI.cream;
+  drawPaperPanel(panel, 18);
   context.textAlign = 'center';
-  context.fillStyle = '#315e37';
+  context.fillStyle = UI.leaf;
   context.font = 'bold 19px sans-serif';
   context.fillText(`确认选择（${game.pendingUpgrade.title}）？`, width / 2, panel.y + 37, panel.width - 28);
-  context.fillStyle = '#71805c';
+  context.fillStyle = UI.moss;
   context.font = '12px sans-serif';
   context.fillText(game.pendingUpgrade.description, width / 2, panel.y + 63, panel.width - 28);
   const buttons = upgradeConfirmBounds();
-  context.fillStyle = '#a58a63'; roundedRect(buttons.cancel.x, buttons.cancel.y, buttons.cancel.width, buttons.cancel.height, 12);
-  context.fillStyle = '#477a3c'; roundedRect(buttons.confirm.x, buttons.confirm.y, buttons.confirm.width, buttons.confirm.height, 12);
-  context.fillStyle = '#fff7d9'; context.font = 'bold 15px sans-serif';
+  drawCelButton(buttons.cancel, UI.moss, 12);
+  drawCelButton(buttons.confirm, UI.leaf, 12);
+  context.fillStyle = UI.cream; context.font = 'bold 15px sans-serif';
   context.fillText('再看看', buttons.cancel.x + buttons.cancel.width / 2, buttons.cancel.y + 30);
   context.fillText('确认选择', buttons.confirm.x + buttons.confirm.width / 2, buttons.confirm.y + 30);
 }
@@ -5429,18 +8007,31 @@ function runGrade() {
   return { grade: 'C', label: '还需努力', color: '#7a9861' };
 }
 
+// 结算页的「这一局走到哪了」：胜利 / 见到首领但没击退 / 还没见到首领。
+// 结算页原来只说「坚持 N 秒」，玩家不知道自己离终点有多远 —— 这条把它补上。
+function runArcLabel() {
+  const wave = `第 ${fmtInt(game.wave)} 波`;
+  if (game.resultWon) return `首领已击退 · ${wave}`;
+  if (game.bossSpawned) return `首领未击退 · ${wave}`;
+  const left = Math.max(0, bossSpawnTime - game.elapsed);
+  return `${wave} · 差 ${fmtInt(Math.ceil(left))} 秒见到首领`;
+}
+
 function drawResult() {
   drawGameBackground();
-  context.fillStyle = 'rgba(255, 250, 226, 0.92)';
-  roundedRect(24, height * 0.20, width - 48, height * 0.60, 20);
+  drawPaperPanel({ x: 24, y: height * 0.20, width: width - 48, height: height * 0.60 }, 20);
   context.textAlign = 'center';
-  context.fillStyle = '#315e37';
+  context.fillStyle = UI.leaf;
   context.font = 'bold 30px sans-serif';
   context.fillText(game.resultWon ? '首领击退！' : (game.earlySettled ? '提前结算' : '本局结束'), width / 2, height * 0.31);
   context.font = '17px sans-serif';
   context.fillText(game.resultWon ? `成功清理 ${game.kills} 只捣蛋虫` : `清理 ${game.kills} 只捣蛋虫`, width / 2, height * 0.39);
-  context.fillText(`坚持 ${Math.floor(game.elapsed)} 秒 · 到达 Lv.${game.level}`, width / 2, height * 0.45);
-  context.fillStyle = '#b37c2e';
+  context.fillText(`坚持 ${fmtInt(game.elapsed)} 秒 · 到达 Lv.${fmtInt(game.level)}`, width / 2, height * 0.45);
+  // 一局的「进度感」：死也要知道自己离终点多远。终点 = bossSpawnTime 的首领战。
+  context.fillStyle = UI.moss;
+  context.font = '13px sans-serif';
+  context.fillText(runArcLabel(), width / 2, height * 0.425);
+  context.fillStyle = UI.amberDark;
   context.font = 'bold 16px sans-serif';
   context.fillText(`金币 +${game.coinsEarned}（${profile.coins}） · 种子 +${game.seedsEarned}（${profile.seeds}）`, width / 2, height * 0.51);
   context.fillStyle = '#c0603a';
@@ -5454,17 +8045,28 @@ function drawResult() {
   context.fillStyle = grade.color;
   context.font = 'bold 15px sans-serif';
   context.fillText(`${grade.grade} · ${grade.label}   |   本局清理 ${show(game.kills)} 只 · 连杀峰值 ${show(game.bestCombo)}`, width / 2, height * 0.60);
-  context.fillStyle = '#71805c';
+  context.fillStyle = UI.moss;
   context.font = '11px sans-serif';
   context.fillText(`金色技能 ${game.goldPicks} 次 · 红色技能 ${game.redPicks} 次`, width / 2, height * 0.635);
+  // 死因复盘：死得明白比死得容易重要 —— 这句同时告诉玩家「被什么打死」和「下次怎么躲」。
+  if (game.deathCause) {
+    context.fillStyle = UI.danger;
+    context.font = '10px sans-serif';
+    context.fillText(`致命伤：${game.deathCause.name}（${fmtInt(game.deathCause.damage)} 点）—— ${game.deathCause.advice}`, width / 2, height * 0.678, width - 56);
+  }
+  // 性能摘要：没有 Performance 面板也能知道这局跑得怎么样（数字同样不带小数点）
+  if (game.perfRun) {
+    context.fillStyle = game.perfRun.fps >= 45 ? UI.leafLight : UI.danger;
+    context.font = '10px sans-serif';
+    context.fillText(`性能 平均 ${fmtInt(game.perfRun.fps)} fps · 最差帧 ${fmtInt(game.perfRun.worst)}ms · 实体峰值 ${fmtInt(game.perfRun.peak)}`, width / 2, height * 0.657);
+  }
 
   const resultButton = resultButtonBounds();
-  context.fillStyle = '#315e37';
-  roundedRect(resultButton.x, resultButton.y, resultButton.width, resultButton.height, 14);
-  context.fillStyle = '#fff7d9';
+  drawCelButton(resultButton, UI.leaf, 14);
+  context.fillStyle = UI.cream;
   context.font = 'bold 18px sans-serif';
   context.fillText('再来一局', width / 2, resultButton.y + 33);
-  context.fillStyle = '#477a3c';
+  context.fillStyle = UI.leafLight;
   context.font = '15px sans-serif';
   context.fillText('点击其他位置返回首页', width / 2, height * 0.72);
 }
@@ -5482,6 +8084,13 @@ function moveJoystick(touch) {
   const strength = limitedDistance / joystick.radius;
   game.input.x = distance ? dx / (Math.sqrt(dx * dx + dy * dy) || 1) * strength : 0;
   game.input.y = distance ? dy / (Math.sqrt(dx * dx + dy * dy) || 1) * strength : 0;
+  // 方向记忆：只有输入强度够大才记，手抖不算「最后移动方向」
+  const memoryStrength = Math.sqrt(game.input.x * game.input.x + game.input.y * game.input.y);
+  if (memoryStrength >= balance.moveMemoryMinInput) {
+    game.lastMoveX = game.input.x / memoryStrength;
+    game.lastMoveY = game.input.y / memoryStrength;
+    game.lastMoveAt = Date.now();
+  }
 }
 
 // Every character has exactly one active skill on the bottom-right button.
@@ -5514,7 +8123,8 @@ function useActiveSkill() {
 }
 
 function skillButtonBounds() {
-  return { x: width - 58, y: height - 100, radius: 33 };
+  // 底部也让出安全区（Home 指示条）；向左上收 16/12，给「向右下拖」多留行程。
+  return { x: width - 96, y: height - viewInsets.bottom - 112, radius: 33 };
 }
 
 function isSkillButtonHit(touch) {
@@ -5524,56 +8134,427 @@ function isSkillButtonHit(touch) {
   return dx * dx + dy * dy <= button.radius * button.radius;
 }
 
-function activateDash() {
-  if (!game || game.character !== 'supreme' || game.dashCooldown > 0) return;
-  let dx = game.input.x;
-  let dy = game.input.y;
+// 充能上限成长：红卡一次、棍子首次到 6 根一次；提升时立刻补 1 格。
+function grantChargeSlot(source) {
+  if (!game || game.character !== 'supreme') return;
+  const flagKey = source === 'red' ? 'redChargeBonusGranted' : 'stickChargeBonusGranted';
+  if (game[flagKey]) return;
+  game[flagKey] = true;
+  if ((game.dashChargeMax || 0) >= balance.dashChargeMaxCap) return;
+  game.dashChargeMax = Math.min(balance.dashChargeMaxCap, (game.dashChargeMax || 0) + 1);
+  game.dashCharges = Math.min(game.dashChargeMax, (game.dashCharges || 0) + 1);
+  const label = source === 'red' ? '红色技能' : '棍阵成型';
+  game.plantNotice = { text: `${label} · 冲刺充能上限 +1（${game.dashCharges}/${game.dashChargeMax}）`, life: 2.8 };
+  addShake(3, 0.12);
+}
+
+// 技能现在是否可放：至尊奶看充能，其他角色看冷却
+function skillReady() {
+  if (!game) return false;
+  if (game.character === 'supreme') return (game.dashCharges || 0) > 0;
+  return activeSkillCooldown() <= 0;
+}
+
+// 冲刺伤害：前期与旧版持平（Lv1 仍是 6），中后期随棍阵成长 —— 这是「棍阵是本体」的数值表达
+// 有效棍数：软上限内 100%，超出每根 60%，硬上限封顶。伤害按它算，画面仍画真实根数。
+function effectiveStickCount() {
+  const real = Math.min(balance.orbitStickCap, (game.orbitStickCount || 0) + (game.dashRodBonus || 0));
+  if (real <= balance.orbitStickSoftCap) return real;
+  return balance.orbitStickSoftCap + (real - balance.orbitStickSoftCap) * balance.orbitStickOverflowEfficiency;
+}
+
+// 加棍：到硬上限后自动转攻击，任何一张棍子卡都不会变成废卡。
+function addSticks(amount) {
+  for (let index = 0; index < amount; index += 1) {
+    if (game.orbitStickCount < balance.orbitStickCap) game.orbitStickCount += 1;
+    else game.bonusAttack += balance.orbitStickOverflowAttack;
+  }
+}
+
+// 破甲：所有击退都叠层，受伤 = 1 + 层数 × 12%（首领最多 2 层）。
+function addArmorBreak(enemy, stacks) {
+  if (!enemy || enemy.health <= 0) return;
+  const cap = enemy.boss ? balance.armorBreakBossMax : balance.armorBreakMax;
+  enemy.armorBreak = Math.min(cap, (enemy.armorBreak || 0) + Math.max(1, stacks || 1));
+  enemy.armorBreakTimer = balance.armorBreakLife + (game.armorBreakLifeBonus || 0);
+}
+
+
+function dashDamage() {
+  if (!game) return 0;
+  const sticks = game.orbitStickCount + (game.dashRodBonus || 0);
+  const base = game.baseAttack + game.bonusAttack + 2 + sticks * 2 + game.dashBonusDamage * 2;
+  return Math.round(base * (1 + 0.25 * (game.dashRodPower || 0)));
+}
+
+// 冲刺方向解析：摇杆 → 1.2 秒方向记忆 → facing（不再自动索敌）
+function resolveDashDirection() {
+  const inputLength = Math.sqrt(game.input.x * game.input.x + game.input.y * game.input.y);
+  if (inputLength >= balance.moveMemoryMinInput) {
+    return { x: game.input.x / inputLength, y: game.input.y / inputLength };
+  }
+  const memoryAge = Date.now() - (game.lastMoveAt || -99999);
+  const memoryLength = Math.sqrt((game.lastMoveX || 0) ** 2 + (game.lastMoveY || 0) ** 2);
+  if (memoryAge <= balance.moveMemoryMs && memoryLength > 0.01) {
+    return { x: game.lastMoveX / memoryLength, y: game.lastMoveY / memoryLength };
+  }
+  return { x: game.facing, y: 0 };
+}
+
+// 冲刺上限（屏幕）：移速 × 倍率 × 时长 × 世界缩放
+function dashMaxScreenDistance() {
+  if (!game) return 0;
+  return game.moveSpeed * balance.dashSpeedFactor * balance.dashDuration * gameWorldZoom;
+}
+
+// 手指相对技能键的拖动向量（方向 + 长度）
+function aimDragVector() {
+  const button = skillButtonBounds();
+  const dx = (game.aimRawX || 0) - button.x;
+  const dy = (game.aimRawY || 0) - button.y;
   const length = Math.sqrt(dx * dx + dy * dy);
-  if (length < 0.08) { dx = game.facing; dy = 0; }
+  const dirX = length > 1e-6 ? dx / length : game.facing;
+  const dirY = length > 1e-6 ? dy / length : 0;
+  return { dx, dy, length, dirX, dirY };
+}
+
+// 沿方向可达的屏幕距离：世界边界（含顶部 72 安全边）会夹住冲刺
+function dashReachableScreen(dirX, dirY) {
+  const max = dashMaxScreenDistance();
+  const worldMax = max / gameWorldZoom;
+  const radius = game.player.radius;
+  let reach = worldMax;
+  if (dirX > 1e-6) reach = Math.min(reach, (game.worldWidth - radius - game.player.x) / dirX);
+  if (dirX < -1e-6) reach = Math.min(reach, (game.player.x - radius) / -dirX);
+  if (dirY > 1e-6) reach = Math.min(reach, (game.worldHeight - radius - game.player.y) / dirY);
+  if (dirY < -1e-6) reach = Math.min(reach, (game.player.y - (72 + radius)) / -dirY);
+  return Math.max(0, reach) * gameWorldZoom;
+}
+
+// 技能键到安全区边缘、沿该方向的可用手指行程（屏幕 px）
+function dashDragRoom(dirX, dirY) {
+  const button = skillButtonBounds();
+  let room = Infinity;
+  if (dirX > 1e-6) room = Math.min(room, (width - button.x) / dirX);
+  if (dirX < -1e-6) room = Math.min(room, button.x / -dirX);
+  if (dirY > 1e-6) room = Math.min(room, (height - viewInsets.bottom - button.y) / dirY);
+  if (dirY < -1e-6) room = Math.min(room, (button.y - viewInsets.top) / -dirY);
+  return Math.max(0, room);
+}
+
+// 该方向「拖到满距」需要的手指行程：空间足够时 = D_max（1:1）；空间不足才补增益。
+// 拖到 92% 可用行程即视为满距，留 8% 余量给手指/安全区。
+function dashDragNeed(dirX, dirY) {
+  const max = dashMaxScreenDistance();
+  const room = dashDragRoom(dirX, dirY);
+  return Math.min(max, Math.max(40, room * 0.92));
+}
+
+// 箭头长度 = 冲刺距离：能 1:1 就 1:1，空间不足时按可用行程自适应补增益；再夹可达距离 + 三档吸附
+function aimDashScreenDistance(dirX, dirY) {
+  const drag = aimDragVector();
+  const max = dashMaxScreenDistance();
+  const need = dashDragNeed(dirX, dirY);
+  const raw = Math.min(max, Math.min(1, drag.length / need) * max);
+  const tiers = balance.dashSnapTiers.map((ratio) => ratio * max);
+  let snapped = -1;
+  const current = game.aimSnapTier;
+  if (current >= 0 && current < tiers.length) {
+    if (Math.abs(raw - tiers[current]) <= balance.dashSnapWindow + balance.dashSnapHysteresis) snapped = current;
+  }
+  if (snapped < 0) {
+    for (let index = 0; index < tiers.length; index += 1) {
+      if (Math.abs(raw - tiers[index]) <= balance.dashSnapWindow) { snapped = index; break; }
+    }
+  }
+  game.aimSnapTier = snapped;
+  const length = snapped >= 0 ? tiers[snapped] : raw;
+  const reachable = dashReachableScreen(dirX, dirY);
+  return Math.min(reachable, Math.max(0, length));
+}
+
+// 原始指针：手指方向 × 原始拖动长度（不吸附、不锁目标），只用于选目标
+function aimPointer() {
+  const playerScreen = worldToScreen(game.player.x, game.player.y);
+  const drag = aimDragVector();
+  const length = Math.min(dashReachableScreen(drag.dirX, drag.dirY), drag.length);
+  return { x: playerScreen.x + drag.dirX * length, y: playerScreen.y + drag.dirY * length };
+}
+
+// 箭头尖端位置（锁定目标时指向目标，长度仍 = 冲刺距离）
+function aimCrosshair() {
+  const playerScreen = worldToScreen(game.player.x, game.player.y);
+  const target = game.aimTarget && game.aimTarget.health > 0 ? game.aimTarget : null;
+  let dirX;
+  let dirY;
+  if (target) {
+    const targetCenter = enemyVisualCenter(target);
+    const dx = targetCenter.x - playerScreen.x;
+    const dy = targetCenter.y - playerScreen.y;
+    const length = Math.sqrt(dx * dx + dy * dy) || 1;
+    dirX = dx / length;
+    dirY = dy / length;
+  } else {
+    const drag = aimDragVector();
+    dirX = drag.dirX;
+    dirY = drag.dirY;
+  }
+  let length;
+  if (target) {
+    const targetCenter = enemyVisualCenter(target);
+    const targetDistance = Math.sqrt((targetCenter.x - playerScreen.x) ** 2 + (targetCenter.y - playerScreen.y) ** 2);
+    length = Math.min(dashReachableScreen(dirX, dirY), targetDistance);
+  } else {
+    length = aimDashScreenDistance(dirX, dirY);
+  }
+  return { x: playerScreen.x + dirX * length, y: playerScreen.y + dirY * length, dirX, dirY, length };
+}
+
+// 锁定：准星 28px 内最近敌人；已锁定的目标要离开 40px 才换（防抖）
+function updateAimTarget() {
+  // 超距取消提示：拖动长度 > 1.5 倍上限
+  const dragVector = aimDragVector();
+  const dragNeed = dashDragNeed(dragVector.dirX, dragVector.dirY);
+  game.aimOverdrag = dragVector.length > dragNeed * balance.dashOverdragRatio;
+  if (!game || !game.aimActive) { if (game) game.aimTarget = null; return; }
+  const cross = aimPointer();
+  const current = game.aimTarget;
+  if (current && current.health > 0) {
+    const currentCenter = enemyVisualCenter(current);
+    const currentX = currentCenter.x;
+    const currentY = currentCenter.y;
+    if (Math.sqrt((currentX - cross.x) ** 2 + (currentY - cross.y) ** 2) <= balance.aimLockKeepRadius) return;
+  }
+  game.aimTarget = null;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const enemy of game.enemies) {
+    if (enemy.health <= 0 || !isEnemyVisible(enemy)) continue;
+    const enemyCenter = enemyVisualCenter(enemy);
+    const enemyX = enemyCenter.x;
+    const enemyY = enemyCenter.y;
+    const distance = Math.sqrt((enemyX - cross.x) ** 2 + (enemyY - cross.y) ** 2);
+    if (distance <= balance.aimLockRadius && distance < bestDistance) { best = enemy; bestDistance = distance; }
+  }
+  game.aimTarget = best;
+}
+
+// 退出瞄准（取消或释放）
+function clearAim() {
+  if (!game) return;
+  game.aimActive = false;
+  game.aimTarget = null;
+  game.grenadeAimTarget = null;
+  game.grenadeAimOverdrag = false;
+  skillTouchId = null;
+}
+
+// 松手：超距取消 / 回拖取消 / 正常释放（方向 + 箭头长度）
+function releaseAim() {
+  const drag = aimDragVector();
+  if (game.aimOverdrag) { clearAim(); return; }
+  if (drag.length <= balance.aimCancelRadius) { clearAim(); return; }
+  const target = game.aimTarget && game.aimTarget.health > 0 ? game.aimTarget : null;
+  let dirX = drag.dirX;
+  let dirY = drag.dirY;
+  if (target) {
+    const playerScreen = worldToScreen(game.player.x, game.player.y);
+    const targetCenter = enemyVisualCenter(target);
+    const dx = targetCenter.x - playerScreen.x;
+    const dy = targetCenter.y - playerScreen.y;
+    const length = Math.sqrt(dx * dx + dy * dy) || 1;
+    dirX = dx / length;
+    dirY = dy / length;
+  }
+  let screenDistance;
+  if (target) {
+    const playerScreen = worldToScreen(game.player.x, game.player.y);
+    const targetCenter = enemyVisualCenter(target);
+    const targetDistance = Math.sqrt((targetCenter.x - playerScreen.x) ** 2 + (targetCenter.y - playerScreen.y) ** 2);
+    screenDistance = Math.min(dashReachableScreen(dirX, dirY), targetDistance);
+  } else {
+    screenDistance = aimDashScreenDistance(dirX, dirY);
+  }
+  clearAim();
+  if (screenDistance <= 1) return;
+  activateDash(dirX, dirY, screenDistance);
+}
+
+function activateDash(targetX, targetY, screenDistance) {
+  if (!game || game.character !== 'supreme' || (game.dashCharges || 0) <= 0) return;
+  let dx = targetX;
+  let dy = targetY;
+  if (dx === undefined || dy === undefined) {
+    const resolved = resolveDashDirection();
+    dx = resolved.x; dy = resolved.y;
+  }
+  const length = Math.sqrt(dx * dx + dy * dy);
+  if (length < 1e-6) { dx = game.facing; dy = 0; }
   else { dx /= length; dy /= length; }
   if (Math.abs(dx) > 0.05) game.facing = dx < 0 ? -1 : 1;
   game.dashX = dx; game.dashY = dy;
-  game.dashTimer = balance.dashDuration; game.dashCooldown = game.dashCooldownMax;
-  burstParticles(game.player.x, game.player.y, '#8fe6e9', 10);
-  playSound('pickup', 180);
+  // 距离决定时长：箭头多长就冲多远
+  const wantedScreen = screenDistance === undefined ? dashMaxScreenDistance() : screenDistance;
+  const wantedWorld = wantedScreen / gameWorldZoom;
+  const distanceBasedTimer = wantedWorld / (game.moveSpeed * balance.dashSpeedFactor);
+  game.dashTimer = Math.max(0.03, Math.min(balance.dashDuration, distanceBasedTimer));
+  // 消耗 1 格充能；回复计时不清零（那一格继续攒）
+  game.dashCharges = Math.max(0, (game.dashCharges || 0) - 1);
+  game.dashInvulnTimer = game.dashTimer + balance.dashInvulnExtra;
+  game.dashGhosts = [];
+  game.dashGhostTimer = 0;
+  game.dashFirstHit = false;
+  addShake(1.5, 0.08);
+  // 棍意：冲刺把攒下的层数一次性放掉（每层 +25% 冲刺伤害）
+  game.dashRodPower = Math.min(3, game.rodMeter || 0);
+  game.rodMeter = 0;
+  game.dashSpinTimer = game.dashSpinBonus ? balance.dashSpinLife : 0;
+  playSound('dash', 200);
+  burstParticles(game.player.x, game.player.y, UI.dashCyan, 10);
 }
 
 function handleTouchStart(event) {
+  // 过场 2 秒内不接受任何输入：既防连点，也防「过场里点空白」把选择清掉
+  if (portalTransitionAt >= 0) return;
   const touch = event.changedTouches && event.changedTouches[0];
   if (!touch) return;
 
   if (screen === 'menu') {
     const layout = menuLayout();
-    const selected = characters.findIndex((character, index) => insideRect(characterCardBounds(index), touch));
-    if (selected >= 0) { profile.character = characters[selected].id; saveProfile(); draw(); }
-    else if (insideRect(layout.start, touch)) startGame();
-    else if (insideRect(layout.wardrobe, touch)) { screen = 'wardrobe'; draw(); }
-    else if (insideRect(layout.garden, touch)) { screen = 'garden'; draw(); }
-    else if (insideRect(layout.enemyCodex, touch)) { screen = 'enemyCodex'; draw(); }
-    else if (insideRect(layout.skillCodex, touch)) { screen = 'skillCodex'; draw(); }
+    const pickedAt = (x, y) => menuPickAt(x, y);
+    // 1) 抽屉优先：点条目进入，点外部关闭
+    if (menuDrawerOpen) {
+      const panel = menuDrawerBounds();
+      const items = [{ label: '角色面板', screen: 'stats' }].concat(menuSidebarItems().map((item) => ({ label: item.label, screen: item.screen })));
+      for (let index = 0; index < items.length; index += 1) {
+        const rect = menuDrawerItemBounds(index);
+        if (rect.y + rect.height > panel.y + panel.height - 12) break;
+        if (insideRect(rect, touch)) {
+          menuDrawerOpen = false;
+          if (items[index].screen === 'stats') statsReturnScreen = 'menu';
+          screen = items[index].screen;
+          draw();
+          return;
+        }
+      }
+      menuDrawerOpen = false;
+      draw();
+      return;
+    }
+    // 2) 小屏：抽屉按钮 / 顶栏开始
+    if (menuCompact()) {
+      if (insideRect(layout.drawerButton, touch)) { menuDrawerOpen = true; draw(); return; }
+    } else {
+      // 3) 正常屏：侧边栏（第一次点图标展开名称，第二次点条目进入）
+      if (menuSidebarExpanded) {
+        for (let index = 0; index < menuSidebarItems().length; index += 1) {
+          if (insideRect(menuSidebarRowBounds(index), touch)) {
+            const item = menuSidebarItems()[index];
+            menuSidebarExpanded = false;
+            if (item.screen === 'stats') statsReturnScreen = 'menu';
+            screen = item.screen;
+            draw();
+            return;
+          }
+        }
+        menuSidebarExpanded = false;
+        draw();
+        return;
+      }
+      for (let index = 0; index < menuSidebarItems().length; index += 1) {
+        if (insideRect(menuSidebarItemBounds(index), touch)) {
+          menuSidebarExpanded = true;
+          draw();
+          return;
+        }
+      }
+    }
+    // 4) 机制卡的两个按钮
+    if (menuPick && !menuPick.confirmed) {
+      const buttons = menuConfirmBounds();
+      if (insideRect(buttons.confirm, touch)) {
+        profile.character = menuPick.id;
+        saveProfile();
+        // 确认但不开打：卡片收起、光晕保留，玩家还能改主意
+        menuPick = { id: menuPick.id, since: 0, confirmed: true };
+        draw();
+        return;
+      }
+      if (insideRect(buttons.cancel, touch)) {
+        menuPick = { id: profile.character, since: 0, confirmed: true };
+        draw();
+        return;
+      }
+    }
+    // 5) 点角色 → 选中并出机制卡
+    const tapped = pickedAt(touch.clientX, touch.clientY);
+    if (tapped) {
+      menuPick = { id: tapped, since: Date.now(), confirmed: false };
+      draw();
+      return;
+    }
+    // 6) 传送门 = 开始：先进入 2 秒过场（仍在主界面、只留主背景），白屏时再切战斗
+    if (menuPortalHit(touch.clientX, touch.clientY)) {
+      profile.portalGuideDone = true;
+      saveProfile();
+      portalGuideAt = 0;
+      portalTransitionAt = Date.now();
+      if (typeof wx.vibrateShort === 'function') wx.vibrateShort({ type: 'medium' });
+      draw();
+      startLoop();   // 过场需要自己驱动帧，否则只画一帧
+      return;
+    }
+    // 7) 点空白 → 取消选择，回到「上次出战角色」的高亮
+    menuPick = { id: profile.character, since: 0, confirmed: true };
+    menuSidebarExpanded = false;
+    draw();
     return;
   }
-
   if (screen === 'skillCodex') {
-    if (insideRect(backButtonBounds(skillCodexPanel()), touch)) { screen = 'menu'; draw(); return; }
+    // 详情弹层优先：按下先记录起点，滑动/点按在 touchEnd 里判定
+    if (skillCodexDetail !== null) {
+      codexSwipeStartX = touch.clientX;
+      codexSwipeStartY = touch.clientY;
+      codexSwipeX = 0;
+      return;
+    }
+    if (insideRect(backButtonBounds(skillCodexPanel()), touch)) {
+      skillCodexScroll = 0;
+      skillCodexDetail = null;
+      enterMenu();
+      draw();
+      return;
+    }
     for (let index = 0; index < characters.length; index += 1) {
       if (insideRect(skillCodexTabBounds(index), touch)) {
-        skillCodexCharacter = characters[index].id;
-        break;
+        if (skillCodexCharacter !== characters[index].id) {
+          skillCodexCharacter = characters[index].id;
+          skillCodexScroll = 0;
+          skillCodexDetail = null;
+        }
+        draw();
+        return;
       }
+    }
+    // 点具体技能 → 详情
+    const rowIndex = skillCodexRowAt(touch.clientX, touch.clientY);
+    if (rowIndex !== null) {
+      skillCodexDetail = rowIndex;
+      draw();
+      return;
     }
     draw();
     return;
   }
-
   if (screen === 'enemyCodex') {
-    if (insideRect(backButtonBounds(enemyCodexPanel()), touch)) screen = 'menu';
+    if (insideRect(backButtonBounds(enemyCodexPanel()), touch)) enterMenu();
     draw(); return;
   }
 
   if (screen === 'garden') {
-    if (insideRect(backButtonBounds(gardenPanel()), touch)) screen = 'menu';
+    if (insideRect(backButtonBounds(gardenPanel()), touch)) enterMenu();
     else if (insideRect(plantCodexButtonBounds(), touch)) screen = 'codex';
+    else if (insideRect(nurseryButtonBounds(), touch)) tryNursery();
     else gardenProjects.forEach((project, index) => {
       const card = gardenCardBounds(index); const level = profile.garden[project.id];
       if (!insideRect(card, touch) || level >= 10) return;
@@ -5609,14 +8590,39 @@ function handleTouchStart(event) {
   }
 
   if (screen === 'game') {
+    // 性能浮层开关：右上角「02:14」那一片连点 3 下（1.5 秒内）。
+    // 放在最前面，且这一段除了切换浮层不做别的事 —— 时间区域本来没有点击行为。
+    if (insideRect(perfToggleBounds(), touch)) {
+      const now = Date.now();
+      if (now - perf.tapAt > 1500) perf.taps = 0;
+      perf.taps += 1;
+      perf.tapAt = now;
+      if (perf.taps >= 3) togglePerfOverlay(now);
+      return;
+    }
     if (insideRect(pauseButtonBounds(), touch)) {
       game.input = { x: 0, y: 0 };
       joystickTouchId = null;
       joystickOrigin = null;
+      clearAim();
       screen = 'paused';
       draw(); return;
     }
     if (isSkillButtonHit(touch)) {
+      const canHoldAim = game.character === 'supreme'
+        ? skillReady()
+        : game.character === 'rabbit' && game.grenadeCooldown <= 0;
+      if (canHoldAim && skillTouchId === null) {
+        // 至尊奶/瘦嘟嘟：先记下按住，180ms 后进 0.1x 瞄准；<180ms 松手就是快速释放
+        skillTouchId = touch.identifier;
+        game.aimHoldStart = Date.now();
+        game.aimRawX = touch.clientX;
+        game.aimRawY = touch.clientY;
+        game.aimActive = false;
+        game.aimTarget = null;
+        game.grenadeAimTarget = null;
+        return;
+      }
       useActiveSkill();
       draw();
       return;
@@ -5642,6 +8648,9 @@ function handleTouchStart(event) {
       screen = 'game';
       lastFrameTime = 0;
       startLoop();
+    } else if (insideRect(buttons.stats, touch)) {
+      statsReturnScreen = 'paused';
+      screen = 'stats';
     } else if (insideRect(buttons.settle, touch)) {
       game.earlySettled = true;
       finishGame(false);
@@ -5650,7 +8659,29 @@ function handleTouchStart(event) {
     return;
   }
 
+  if (screen === 'stats') {
+    // 只认「返回」：面板是全屏的，点其他地方不应该误退到别的屏。
+    if (insideRect(backButtonBounds(statsPanel()), touch)) {
+      screen = statsReturnScreen;
+      resumeLoop();
+      draw();
+    }
+    return;
+  }
+
   if (screen === 'upgrade') {
+    // 角色面板入口先判：它压在卡片上方，顺序反了会先落到卡片上。
+    if (insideRect(statsOpenBounds(), touch)) {
+      statsReturnScreen = 'upgrade';
+      screen = 'stats';
+      draw();
+      return;
+    }
+    // 重抽按钮在卡片下方，独立判定；没抽到满意的卡来这里花金币（价格每次升级从 1 起翻倍）
+    if (insideRect(rerollButtonBounds(), touch)) {
+      if (tryReroll()) draw();
+      return;
+    }
     // The 详细 chip is checked first so tapping it never selects the card underneath.
     for (let index = 0; index < game.upgradeChoices.length; index += 1) {
       if (!hasDetail(game.upgradeChoices[index])) continue;
@@ -5684,12 +8715,22 @@ function handleTouchStart(event) {
     if (insideRect(buttons.confirm, touch) && game.pendingUpgrade) {
       const upgrade = game.pendingUpgrade;
       upgrade.apply();
+      // 记录到角色面板（装备格 / 技能等级）。只有确认吃到才记 —— 卡片被展示不算。
+      // 输出卡保底计数：拿到输出卡清零，否则累加
+      game.offenseDrought = upgrade.offense ? 0 : (game.offenseDrought || 0) + 1;
+      game.upgradeLog.push({ title: upgrade.title, rarity: upgrade.rarity, evolution: !!upgrade.evolution });
+      // 第一次真正吃到卡 = 首局引导结束（只翻一次存档标记）
+      if (game.coachStep > 0) {
+        game.coachStep = 3;
+        if (!profile.tutorialDone) { profile.tutorialDone = true; saveProfile(); }
+      }
       // A red is spent by *taking* it, not by being shown. Setting this when the card was
       // merely offered meant a red appeared exactly once per run (~1 in 190 offerings) and
       // vanished forever if the player picked anything else - measured as "the red never
       // shows up" even across 50-level runs.
       if (upgrade.rarity === 'red') {
         game.redSkillOffered = true;
+        grantChargeSlot('red');
         // 通用规则：拿到红色技能后升级代价提高（整体翻倍 + 每级固定增量变大）。
         // 这里同时把**当前这一级**的需求也立刻抬高，而不是等下一次升级才生效 —— 需求是
         // "拿到后直接翻倍"，所以当级就吃满。
@@ -5698,9 +8739,9 @@ function handleTouchStart(event) {
       }
       const statFactor = balance.rarityStatMultiplier[upgrade.rarity] || 1;
       if (statFactor > 1) {
-        scaleCharacterStats(statFactor);
+        scaleCharacterStats(statFactor, upgrade.rarity);
         applyRarityFlatBonuses(upgrade.rarity);
-        game.plantNotice = { text: `${upgrade.rarity === 'gold' ? '金色' : '红色'}技能：其他属性 ×${statFactor}，速度/距离/攻速固定提升`, life: 3 };
+        game.plantNotice = { text: `${upgrade.rarity === 'gold' ? '金色' : '红色'}技能：其他属性 +${fmtInt((statFactor - 1) * 100)}%，速度/距离/攻速固定提升`, life: 3 };
       }
       levelUpBlast();
       if (upgrade.evolution) evolutionBurst();
@@ -5708,11 +8749,30 @@ function handleTouchStart(event) {
       game.damageCooldown = Math.max(game.damageCooldown, 0.5);
       game.pendingUpgrade = null;
       screen = 'game';
+      resumeLoop();
     } else if (insideRect(buttons.cancel, touch)) {
       game.pendingUpgrade = null;
       screen = 'upgrade';
     }
     draw();
+    return;
+  }
+
+  if (screen === 'bossChoice') {
+    const buttons = bossChoiceBounds();
+    if (insideRect(buttons.settle, touch)) {
+      finishGame(true);
+      draw();
+      return;
+    }
+    if (insideRect(buttons.endless, touch)) {
+      game.bossChoice = null;
+      startEndless();
+      screen = 'game';
+      resumeLoop();
+      draw();
+      return;
+    }
     return;
   }
 
@@ -5726,6 +8786,40 @@ function handleTouchStart(event) {
 }
 
 function handleTouchMove(event) {
+  if (screen === 'skillCodex') {
+    // 详情弹层：横向拖动跟手，松手在 handleTouchEnd 里判定切上/下一个
+    if (skillCodexDetail !== null && codexSwipeStartX !== null) {
+      const swipeTouch = event.touches && event.touches[0];
+      if (!swipeTouch) return;
+      const swipeDx = swipeTouch.clientX - codexSwipeStartX;
+      const swipeLimit = width * 0.45;
+      codexSwipeX = Math.max(-swipeLimit, Math.min(swipeLimit, swipeDx));
+      draw();
+      return;
+    }
+    const touch = event.touches && event.touches[0];
+    if (!touch) return;
+    if (codexDragY === null) { codexDragY = touch.clientY; return; }
+    const delta = touch.clientY - codexDragY;
+    codexDragY = touch.clientY;
+    const next = skillCodexScrollClamp(skillCodexScroll - delta);
+    if (next !== skillCodexScroll) { skillCodexScroll = next; draw(); }
+    return;
+  }
+  if (screen === 'game' && skillTouchId !== null) {
+    const skillTouch = event.touches ? Array.from(event.touches).find((item) => item.identifier === skillTouchId) : null;
+    if (skillTouch) {
+      game.aimRawX = skillTouch.clientX;
+      game.aimRawY = skillTouch.clientY;
+      if (game.aimActive) {
+        if (game.character === 'rabbit') updateGrenadeAimTarget();
+        else updateAimTarget();
+        draw();
+      }
+    }
+    return;
+  }
+
   if (screen !== 'game' || joystickTouchId === null) return;
   const touches = event.touches || [];
   const touch = Array.from(touches).find((item) => item.identifier === joystickTouchId);
@@ -5733,6 +8827,56 @@ function handleTouchMove(event) {
 }
 
 function handleTouchEnd(event) {
+  if (screen === 'game' && skillTouchId !== null) {
+    const changedTouches = event.changedTouches ? Array.from(event.changedTouches) : [];
+    const ended = changedTouches.some((touch) => touch.identifier === skillTouchId) || changedTouches.length === 0;
+    if (ended) {
+      if (game.aimActive) {
+        if (game.character === 'rabbit') releaseGrenadeAim();
+        else releaseAim();
+        draw();
+        return;
+      }
+      if (game.character === 'rabbit') {
+        clearAim();
+        useActiveSkill();   // <180ms：快速投掷（自动选目标）
+        draw();
+        return;
+      }
+      const direction = resolveDashDirection();
+      clearAim();
+      activateDash(direction.x, direction.y);
+      draw();
+      return;
+    }
+  }
+  if (screen === 'skillCodex') {
+    codexDragY = null;
+    if (skillCodexDetail !== null && codexSwipeStartX !== null) {
+      const changed = event.changedTouches && event.changedTouches[0];
+      const endX = changed ? changed.clientX : codexSwipeStartX;
+      const endY = changed ? changed.clientY : codexSwipeStartY;
+      const dx = endX - codexSwipeStartX;
+      const dy = endY - codexSwipeStartY;
+      const startX = codexSwipeStartX;
+      const startY = codexSwipeStartY;
+      codexSwipeStartX = null;
+      codexSwipeStartY = null;
+      codexSwipeX = 0;
+      // 横向位移够大 → 切换；否则当作点按（关闭按钮 / 卡片外关闭）
+      if (Math.abs(dx) >= Math.abs(dy) && Math.abs(dx) > 56) {
+        skillCodexStepDetail(dx < 0 ? 1 : -1);
+        draw();
+        return;
+      }
+      const tapPoint = { clientX: startX, clientY: startY };
+      if (insideRect(skillCodexDetailCloseBounds(), tapPoint) || !insideRect(skillCodexDetailPanel(), tapPoint)) {
+        skillCodexDetail = null;
+      }
+      draw();
+    }
+    return;
+  }
   if (joystickTouchId === null) return;
   const changedTouches = event.changedTouches || [];
   const ended = Array.from(changedTouches).some((touch) => touch.identifier === joystickTouchId);
@@ -5747,15 +8891,18 @@ function draw() {
   if (screen === 'menu') drawMenu();
   else if (screen === 'game') drawGame();
   else if (screen === 'paused') drawPause();
+  else if (screen === 'bossChoice') drawBossChoice();
   else if (screen === 'upgrade') drawUpgrade();
   else if (screen === 'upgradeDetail') drawUpgradeDetail();
   else if (screen === 'upgradeConfirm') drawUpgradeConfirm();
   else if (screen === 'result') drawResult();
+  else if (screen === 'stats') drawStats();
   else if (screen === 'wardrobe') drawWardrobe();
   else if (screen === 'garden') drawGarden();
   else if (screen === 'codex') drawCodex();
   else if (screen === 'enemyCodex') drawEnemyCodex();
   else if (screen === 'skillCodex') drawSkillCodex();
+  drawPortalFlash();
 }
 
 wx.onTouchStart(handleTouchStart);

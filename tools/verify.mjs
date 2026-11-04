@@ -989,6 +989,95 @@ if (a6Builtin.length) {
 }
 
 // ---------------------------------------------------------------------------
+// A7 界面数字：屏幕上不允许出现小数
+// ---------------------------------------------------------------------------
+section('A7 界面数字（显示值不带小数点）');
+
+// 口径：**注释外**的源码里不许出现 `.toFixed(`。
+// 为什么拿 toFixed 当代理指标：界面上能产出小数点的写法基本只有它；改造之后所有显示值
+// 都走 fmtInt / fmtCeil / fmtPercent（Math.round + String）。注释里出现是允许的 ——
+// fmtInt 的注释本身就在解释为什么不直接用 toFixed，所以先剥掉行注释再查。
+const sourceNoComments = source
+  .split('\n')
+  .map((line) => {
+    const index = line.indexOf('//');
+    return index >= 0 ? line.slice(0, index) : line;
+  })
+  .join('\n');
+const toFixedHits = sourceNoComments.split('\n')
+  .map((line, index) => ({ line: line.trim(), index: index + 1 }))
+  .filter((entry) => entry.line.includes('.toFixed('));
+assertion(`A7.1 源码注释外没有 .toFixed(（${toFixedHits.length} 处）`,
+  toFixedHits.length === 0,
+  toFixedHits.length
+    ? toFixedHits.map((hit) => `  game.js:${hit.index}  ${hit.line}`).join('\n')
+      + '\n  界面上出现小数点的唯一来源就是 toFixed；显示值请走 fmtInt / fmtCeil / fmtPercent。'
+    : '全部显示值走 fmtInt / fmtCeil / fmtPercent（Math.round + String），小数入口为 0');
+
+const formatters = ['fmtInt', 'fmtCeil', 'fmtPercent'];
+const missingFormatters = formatters.filter((name) => !new RegExp(`function ${name}\\(`).test(source));
+assertion(`A7.2 三个格式化函数都已定义（${formatters.join(' / ')}）`,
+  missingFormatters.length === 0,
+  missingFormatters.length ? `缺少：${missingFormatters.join('、')}` : '定义在 game.js 顶部「数字显示」一节');
+const formatterUses = formatters.reduce((sum, name) => sum + (source.match(new RegExp(`${name}\\(`, 'g')) || []).length, 0);
+info(`A7 格式化函数使用处 ${formatterUses} 处`, '数字显示改造的覆盖率指标；新增显示值都应落进这个计数');
+
+// 角色面板的布局必须是「屏幕尺寸的纯函数」，和 menuLayout / pauseButtonBounds 同一个纪律，
+// 否则测试里的点击坐标会和实际绘制位置分叉。
+const statsLayoutFunctions = ['statsPanel', 'statsOpenBounds', 'statsRowBounds', 'statsSlotBounds'];
+const missingStatsLayout = statsLayoutFunctions.filter((name) => !new RegExp(`function ${name}\\(`).test(source));
+assertion('A7.3 角色面板布局函数齐全（屏幕尺寸纯函数）',
+  missingStatsLayout.length === 0,
+  missingStatsLayout.length ? `缺少：${missingStatsLayout.join('、')}` : statsLayoutFunctions.join(' / '));
+
+// 颜色字面量棘轮（只许降，不许升）。
+// 背景：208 个色字面量一次性收敛成 token 会产出 200+ 行 diff，风险大于收益，所以采用
+// 「新代码只走 UI.<token>，存量随改动自然收敛」的策略。棘轮就是这条策略的牙齿：
+// 编号可以不变，但**数量不许上升**。降下来之后把 BASELINE 一起改小，闸会自动变紧。
+const UI_COLOR_BASELINE = 264;  // 2026-10-23 配色优化：62 处裸色值收进 UI 语义 token（335 → 264）
+const colorSource = sourceNoComments;
+const uiStart = colorSource.indexOf('const UI = {');
+const uiEnd = uiStart >= 0 ? colorSource.indexOf('};', uiStart) : -1;
+const outsideTokenBlock = uiStart >= 0 && uiEnd > uiStart
+  ? colorSource.slice(0, uiStart) + colorSource.slice(uiEnd)
+  : colorSource;
+const bareHex = (outsideTokenBlock.match(/'#[0-9a-fA-F]{3,8}'/g) || []).length;
+const bareRgba = (outsideTokenBlock.match(/rgba\([^)]*\)/g) || []).length;
+const bareColors = bareHex + bareRgba;
+assertion(`A7.4 裸色值数量不上升（${bareColors} ≤ ${UI_COLOR_BASELINE}；hex ${bareHex} + rgba ${bareRgba}）`,
+  bareColors <= UI_COLOR_BASELINE,
+  bareColors > UI_COLOR_BASELINE
+    ? `新增了 ${bareColors - UI_COLOR_BASELINE} 个裸色值。新代码请用 UI.<token>（见 game.js 顶部「界面令牌」），`
+      + '确实需要新色就先加进 UI 表再引用。'
+    : bareColors < UI_COLOR_BASELINE
+      ? `比基线少了 ${UI_COLOR_BASELINE - bareColors} 个 —— 请把 tools/verify.mjs 的 UI_COLOR_BASELINE 改成 ${bareColors}，闸会自动变紧`
+      : '与基线持平');
+
+// A7.5 屏幕分派完整性：每个被赋值的 screen 都必须在 draw() 里有一条分支。
+// 这是这一轮最容易犯的错（新增一个屏、忘了接线，运行时不报错、只是黑屏）。
+// 做法：扒 `screen = 'xxx'` 的字符串字面量，再扒 draw() 里的 `screen === 'xxx'`。
+const assignedScreens = new Set();
+for (const match of source.matchAll(/screen\s*=\s*'([a-zA-Z]+)'/g)) assignedScreens.add(match[1]);
+const assignedViaTernary = new Set();
+for (const match of source.matchAll(/screen\s*=\s*statsReturnScreen|statsReturnScreen\s*=\s*'([a-zA-Z]+)'/g)) {
+  if (match[1]) assignedViaTernary.add(match[1]);
+}
+const drawBodyIndex = source.indexOf('function draw() {');
+const drawBody = drawBodyIndex >= 0 ? source.slice(drawBodyIndex, source.indexOf('\n}', drawBodyIndex)) : '';
+const dispatchedScreens = new Set();
+for (const match of drawBody.matchAll(/screen\s*===\s*'([a-zA-Z]+)'/g)) dispatchedScreens.add(match[1]);
+const undispatched = [...assignedScreens].filter((name) => !dispatchedScreens.has(name));
+assertion(`A7.5 每个 screen 都有对应的绘制分支（赋值 ${assignedScreens.size} 个 / 分派 ${dispatchedScreens.size} 个）`,
+  undispatched.length === 0,
+  undispatched.length
+    ? `这些 screen 会被赋值但没有绘制分支（运行时不报错，表现为黑屏/上一屏残留）：${undispatched.join('、')}`
+    : `已被分派：${[...dispatchedScreens].sort().join(' / ')}`);
+if (assignedViaTernary.size) {
+  info(`A7 会回跳到 ${[...assignedViaTernary].sort().join('、')} 的屏（statsReturnScreen）`,
+    '回跳目标不参与 A7.5（它不是 draw() 的分支，而是「返回时回到哪一屏」）');
+}
+
+// ---------------------------------------------------------------------------
 // 汇总
 // ---------------------------------------------------------------------------
 

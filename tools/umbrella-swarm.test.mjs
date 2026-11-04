@@ -35,21 +35,22 @@ vm.runInContext('(function(){ let s = 1; Math.random = function(){ s = (s + 0x6D
 vm.runInContext(SOURCE, context, { filename: 'game.js' });
 const bridge = vm.runInContext(`(function(){ return {
   get game(){return game;}, get screen(){return screen;}, get balance(){return balance;},
-  get profile(){return profile;}, get characters(){return characters;},
+  get profile(){return profile;},
+    pickCharacter: function (id) { profile.character = id; saveProfile(); },
+    startGame: startGame, get characters(){return characters;},
   get umbrellaSprite(){return umbrellaSprite;}, get umbrellaReady(){return umbrellaReady;},
   updateOneUmbrella: updateOneUmbrella, pickHighestHealthEnemy: pickHighestHealthEnemy,
-  draw: draw, characterCardBounds: characterCardBounds, menuLayout: menuLayout,
+  draw: draw, menuLayout: menuLayout,
   setClock: function(v){ Date.now = function(){ return v|0; }; },
 }; })()`, context, { filename: 'umbrella-bridge.js' });
 bridge.setClock(0);
 // 必须显式触发图片加载：wx 桩的 createImage() 不会自动 onload，
 // 不调这一句 umbrellaReady 永远为 false（第一版就栽在这里，4 条绘制断言全假失败）。
 stub.flushImageLoads();
-const idx = bridge.characters.findIndex((c) => c.id === 'xiaoxian');
-const card = bridge.characterCardBounds(idx);
-stub.touch.start({ identifier: 9, clientX: card.x + card.width / 2, clientY: card.y + card.height / 2 });
-const layout = bridge.menuLayout();
-stub.touch.start({ identifier: 9, clientX: layout.start.x + layout.start.width / 2, clientY: layout.start.y + layout.start.height / 2 });
+// 主菜单已改为「点角色选择」：直接指定出战角色（等价于点角色 + 确定出战）
+    bridge.pickCharacter('xiaoxian');
+// 主菜单 v3：开始要经过 2 秒过场，这里只验证「进入战斗后的玩法」，直接开一局
+bridge.startGame();
 
 const game = bridge.game;
 const balance = bridge.balance;

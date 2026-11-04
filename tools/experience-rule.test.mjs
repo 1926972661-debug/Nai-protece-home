@@ -46,6 +46,8 @@ function boot(character) {
       get screen() { return screen; },
       get balance() { return balance; },
       get profile() { return profile; },
+    pickCharacter: function (id) { profile.character = id; saveProfile(); },
+    startGame: startGame,
       get characters() { return characters; },
       get upgrades() { return upgrades; },
       get rabbitUpgrades() { return rabbitUpgrades; },
@@ -53,7 +55,6 @@ function boot(character) {
       get xiaoxianUpgrades() { return xiaoxianUpgrades; },
       experienceNeededFor: experienceNeededFor,
       gainExperience: gainExperience,
-      characterCardBounds: characterCardBounds,
       menuLayout: menuLayout,
       upgradeConfirmBounds: upgradeConfirmBounds,
       setScreen: function (v) { screen = v; },
@@ -61,11 +62,10 @@ function boot(character) {
     };
   })()`, context, { filename: 'xp-bridge.js' });
   bridge.setClock(0);
-  const idx = bridge.characters.findIndex((c) => c.id === character);
-  const card = bridge.characterCardBounds(idx);
-  stub.touch.start({ identifier: 9, clientX: card.x + card.width / 2, clientY: card.y + card.height / 2 });
-  const layout = bridge.menuLayout();
-  stub.touch.start({ identifier: 9, clientX: layout.start.x + layout.start.width / 2, clientY: layout.start.y + layout.start.height / 2 });
+  // 主菜单已改为「点角色选择」：直接指定出战角色（等价于点角色 + 确定出战）
+    bridge.pickCharacter(character);
+  // 主菜单 v3：开始要经过 2 秒过场，这里只验证「进入战斗后的玩法」，直接开一局
+bridge.startGame();
   return { bridge, stub };
 }
 

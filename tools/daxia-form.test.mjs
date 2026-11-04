@@ -40,6 +40,8 @@ const bridge = vm.runInContext(`(function () {
     get screen() { return screen; },
     get balance() { return balance; },
     get profile() { return profile; },
+    pickCharacter: function (id) { profile.character = id; saveProfile(); },
+    startGame: startGame,
     get characters() { return characters; },
     fireSwordWave: fireSwordWave,
     updateSwordWaves: updateSwordWaves,
@@ -51,7 +53,6 @@ const bridge = vm.runInContext(`(function () {
     currentBladeScale: currentBladeScale,
     swordWaveDamageAt: swordWaveDamageAt,
     daxiaUpgrades: daxiaUpgrades,
-    characterCardBounds: characterCardBounds,
     menuLayout: menuLayout,
     setClock: function (v) { Date.now = function () { return v | 0; }; },
   };
@@ -59,11 +60,10 @@ const bridge = vm.runInContext(`(function () {
 
 bridge.setClock(0);
 
-const charIndex = bridge.characters.findIndex((c) => c.id === 'daxia');
-const card = bridge.characterCardBounds(charIndex);
-stub.touch.start({ identifier: 9, clientX: card.x + card.width / 2, clientY: card.y + card.height / 2 });
-const layout = bridge.menuLayout();
-stub.touch.start({ identifier: 9, clientX: layout.start.x + layout.start.width / 2, clientY: layout.start.y + layout.start.height / 2 });
+// 主菜单已改为「点角色选择」：直接指定出战角色（等价于点角色 + 确定出战）
+    bridge.pickCharacter('daxia');
+// 主菜单 v3：开始要经过 2 秒过场，这里只验证「进入战斗后的玩法」，直接开一局
+bridge.startGame();
 
 const game = bridge.game;
 const balance = bridge.balance;

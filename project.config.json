@@ -37,6 +37,10 @@
       {
         "type": "folder",
         "value": "tools"
+      },
+      {
+        "type": "folder",
+        "value": "微信小游戏开发图片"
       }
     ],
     "include": []
